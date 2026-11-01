@@ -1,0 +1,538 @@
+# Univer Workspace
+
+A deployable React workspace providing Univer
+collaboration, Node hierarchy management, permissions, Trash, recent Resources,
+and Worktrees.
+
+## Development
+
+Requirements:
+
+- Node.js 24 or newer
+- pnpm 11
+- a Univer license for capabilities that require one
+
+```bash
+pnpm install
+pnpm workspace:dev:server
+pnpm workspace:dev:web
+```
+
+`workspace:dev:server` watches the backend and listens at
+`http://127.0.0.1:3020`. If `dist/public` exists, it also serves that last-built
+static web application; web source changes are not rebuilt or hot-reloaded there.
+
+`workspace:dev:web` starts Vite at `http://127.0.0.1:5173`, enables web
+hot module replacement, and proxies product API and WebSocket requests to port
+3020. Run both commands and open port 5173 for web development. Port 3020
+alone is sufficient for backend work or viewing the latest built web application.
+
+API documentation is available at:
+
+- `http://127.0.0.1:3020/api-docs`
+- `http://127.0.0.1:3020/openapi.yaml`
+
+Product data is stored in `.data/univer-workspace.sqlite`. Univer unit data is
+stored separately in `.data/univer-collaboration.sqlite`, and uploaded Blob
+bytes default to `.data/univer-workspace-blobs`. Thread Comment anchors for
+Sheet, Doc, Slide, Base, and Board remain in Unit snapshots and changesets;
+comment bodies, replies, and solved state use the Comment component in the same
+Collaboration SQLite file. Comment bodies are shared across Trunk, Worktree,
+and Merge Preview editors; only anchors branch and merge with Unit data. The
+Comment protocol has no Worktree semantics, so a comment deleted from a
+Worktree disappears for Trunk as well. See `docs/application-design.md`
+("评论与 Worktree") for the known behaviors and follow-up directions.
+
+The same Collaboration SQLite file stores a persistent History segment index.
+SDK 1.0.0 owns automatic indexing from authoritative Core creation facts and
+changesets. When History has no records, reads calculate segments and persist
+them in the background.
+Trunk Sheet, Doc, Slide, Base, and Board editors use the standard SDK
+version-history UI. Viewers can inspect versions, while users with content edit
+permission can restore one. Worktree and merge-preview editors do not expose
+Trunk History.
+
+The smart workbench offers Workspace Agent downloads and CLI/Skill installation guidance
+when the signed-in user has never created a Worktree and has no visible tasks. Users with
+visible team tasks see a compact introduction alongside their task list.
+
+Worktree review keeps the agent draft as its default view and also offers a
+structured, read-only side-by-side comparison. The Server materializes and
+decodes the authoritative Trunk and draft states, computes semantic differences
+with the matching History SDK adapter, and returns them through the
+authenticated internal `/universer-api` boundary. The Browser supplies its own
+Univer presets and plugins to the comparison viewer; official, agent, and
+merge-preview iframe views remain available. The internal comparison endpoint accepts
+`baseMode=base` to pin the left side to the Unit's captured baseline, and `view=draft`,
+`view=preview` (ready only), or `view=merged` (merged only) for the right side.
+Recorded merge views use the SDK's stored merge revision; Units without that revision
+cannot claim an immutable merge result. The default remains current Trunk versus draft
+for existing Browser consumers. Agent requires these modes for historical Base review;
+new Worktree-local Units have an empty Base and remain reviewable after discard.
+
+Draft Worktrees can also mark individual Units for deletion and undo that intent.
+Ready Worktrees freeze the intent; reopen one before changing it. Merging excludes
+removed Units from content publication, then moves existing documents to Workspace
+Trash. A Unit created and canceled in the same Worktree never becomes a published
+document. Discarding the Worktree leaves existing documents unchanged.
+The per-Unit merge result `removed` describes content exclusion; wait for both Worktree state `merged`
+and a completed merge Operation before treating product deletion as finished.
+A completed attempt that leaves the Worktree ready still needs another merge. Restore a merged
+document through Trash, not through the draft undo action.
+
+The Univer editors import and export XLSX/CSV/TSV, DOCX, and PPTX through the
+server-side `@univerjs-pro/exchange-node` runtime. These endpoints follow the
+Universer Exchange shape under `/universer-api/exchange/**`; they are not part
+of the product OpenAPI. The Workspace file action automatically imports
+XLS/XLSX/CSV/TSV, DOC/DOCX, and PPT/PPTX as normal Univer Resources in the
+selected Space and folder; other file types remain downloadable Blob
+Resources. Editor Ribbon imports default to the root of the signed-in user's
+Personal Space. Uploaded source files, converted JSON snapshots, and export
+files are temporary BlobStore objects with process-local task metadata and a
+two-hour lifetime. Exchange actions are not shown for Worktree or merge-preview
+editors because those scopes do not yet have scope-aware Office conversion.
+
+Office export resolves managed image Asset IDs through the requesting user's
+existing Trunk permissions before conversion, including images in master pages
+and serialized drawing resources. The export copy contains inline image bytes;
+stored snapshots and Assets remain unchanged. Missing, inaccessible or invalid
+images fail the export instead of producing a document with missing pictures.
+
+Doc and Slide editors can read referenced Sheet data in the same editor runtime.
+They register the Sheet data plugins needed to restore source resources, replay
+changesets and resolve formulas before loading the source. Referenced Sheets do
+not add a Sheet toolbar or replace the host editor; source access and Trunk or
+Worktree selection continue to use the Workspace reference provider.
+Live sources join the existing SDK collaboration transport in matching scopes.
+The SDK owns formula dependency invalidation, calculation ordering and result
+application; Workspace does not add a second formula refresh scheduler.
+
+### Repository dashboard
+
+Choose **Repository** in application settings to use OfficeLab's GitHub-style
+dashboard. `/home` shows recently opened files, active Pull requests, and open Issues.
+The global sidebar connects the following views:
+
+- `/repositories`: all accessible repositories, with name/description/owner search,
+  personal/team and visibility filters, name sorting, and repository creation.
+- `/worktrees`: paginated active or processed Pull requests, with server-side search
+  and repository/type filters. Opening a review preserves the list's URL filters.
+- `/issues`: the existing cross-repository Issue list and its filters.
+- `/recent`: paginated recently opened resources.
+- `/apps`: a paginated Pages directory; selecting a Page opens the existing embedded
+  viewer. Existing `node` and `spaceId` links remain supported.
+
+Recent and Pages text searches apply to the loaded results and are labelled accordingly.
+Homepage summaries have separate, bounded queries so returning from a long list does
+not reload every cached page. Directory browsing reads metadata; only opening a file
+or preview records a visit. Pages show real metadata rather than synthetic thumbnails.
+Summary-only Worktree access does not expose a review link.
+
+Wiki keeps its existing home and embedded Apps experience. Repository's navigation
+uses a drawer on narrow screens and supports both interface languages and color themes.
+
+### Markdown files
+
+Uploaded `.md` and `.markdown` files open in a read-only CommonMark/GFM preview,
+with Preview/Source switching and the original download action. Tables, task
+lists, strikethrough and footnotes are supported. Preview and Source both load
+the complete file without a preview size cutoff. Content must be UTF-8 text.
+Raw HTML is shown as text; relative file/image paths are not resolved. External
+images load only after a click. Markdown stays a Blob and does not become a
+collaborative Univer Doc. The Agent remote-file viewer uses the same renderer.
+
+### Configuration
+
+Copy `.env.example` to `.env`. Development, database, and production start
+commands load this file automatically. GitHub OAuth is enabled only when
+`GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and `GITHUB_CALLBACK_URL` are all
+configured.
+
+Create a GitHub OAuth App for each environment. GitHub OAuth Apps accept only
+one callback URL, so local development and production should not share the
+same app. For local development, use:
+
+```text
+Homepage URL: http://127.0.0.1:5173
+Authorization callback URL: http://127.0.0.1:5173/api/auth/github/callback
+```
+
+For the production deployment, create a separate production OAuth App with your own
+deployment domain:
+
+```text
+Homepage URL: https://workspace.example.com/
+Authorization callback URL: https://workspace.example.com/api/auth/github/callback
+```
+
+The callback URL configured in GitHub must exactly match
+`GITHUB_CALLBACK_URL`.
+
+Once configured, the sign-in page shows **Continue with GitHub**. A first-time
+GitHub login creates the product User and Personal Space; an existing signed-in
+User can link GitHub from the account menu. Access tokens are used only to load
+the GitHub profile during sign-in and are not persisted.
+
+Set `GITHUB_ALLOWED_ORGANIZATIONS` to a comma-separated list of GitHub
+organization names to require active membership in at least one listed
+organization for GitHub login, first-time registration, and account linking.
+This enables the GitHub `read:org` OAuth scope and checks membership during every
+GitHub OAuth callback. Existing Workspace sessions remain valid until they expire
+or are logged out. This setting restricts only GitHub OAuth; password registration,
+Discord login, and trusted Discord Bot login remain separate authentication paths.
+
+Password registration, password login, and password changes stay available unless
+`PASSWORD_AUTH_ENABLED` is `false`. A restricted deployment sets that value
+together with `GITHUB_ALLOWED_ORGANIZATIONS` and leaves Discord unset, so the
+only browser sign-in path is GitHub membership in a listed organization. The
+process refuses to start when password authentication is off and neither GitHub
+nor Discord OAuth is configured. Existing sessions remain valid until they
+expire or are logged out. A user who only has a password cannot sign in again
+after that, and a stored password no longer counts as a remaining sign-in
+method when unlinking GitHub or Discord.
+
+Set `TRIAL_DEPLOYMENT=true` on a public trial deployment. After signing in, each
+User sees a dialog stating that the environment does not guarantee data
+durability and linking to the open-source repository for self-hosting. The
+acknowledgement is stored in the browser's `localStorage` per User, so the
+dialog appears again in a new browser or after site data is cleared. Visitors
+and the sign-in page do not show the notice. The flag defaults to `false`.
+
+Workspace CLI uses browser approval by default. `uvw auth login`
+creates a ten-minute, one-time authorization request and prints a `/cli-login`
+URL plus verification code, persists the pending request locally, and exits.
+After the user approves the matching code in their own browser, the Agent runs
+`uvw auth login --complete` to exchange it once; neither command
+waits or polls. If necessary, the user can first sign in with GitHub, Discord,
+or a password and return to the approval page. The CLI receives a separate
+normal `workspace_session`; it never
+receives the browser cookie, Workspace password, or provider access token.
+Pending authorization requests are process-local and intentionally disappear
+on server restart; completed CLI sessions remain normal persisted login sessions.
+
+Discord OAuth login and account linking are enabled when
+`DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET`, and `DISCORD_CALLBACK_URL` are
+all configured. Add this redirect in the Discord Developer Portal for local
+development:
+
+```text
+http://127.0.0.1:5173/api/auth/discord/callback
+```
+
+The redirect must exactly match `DISCORD_CALLBACK_URL`. Workspace requests
+only the `identify` scope, stores the stable Discord User ID and username, and
+does not persist the access token. A separate Discord App integration can use
+that stable ID to map Discord users to Workspace users.
+
+A trusted Discord Bot server can log a Discord user into Workspace through
+`POST /api/auth/discord/bot-login`. Configure the same random secret of at
+least 32 characters as `DISCORD_BOT_API_KEY` in Workspace and send it from the
+Bot server as the `x-api-key` header. The request must contain the stable
+`discordUserId`; `username`, `displayName`, and `avatarUrl` are optional. The
+endpoint resolves or creates the Workspace User and Personal Space, then
+returns the normal authenticated session response and `workspace_session`
+cookie. Only the trusted Bot server may call this endpoint; never expose the
+shared key to a Discord client or browser. If the Bot initially supplies only
+`discordUserId`, Workspace creates placeholder profile fields; a later Discord
+OAuth login fills those placeholders from the verified Discord profile without
+replacing profile fields that the User has already customized.
+
+Workspace exposes a generic OAuth-style authorization capability. A registered
+external client starts `GET /api/auth/authorize`; the authorize endpoint reuses
+`workspace_session`, redirecting through the existing login page only when the
+session is absent, then returns a one-time short-lived code to the registered
+redirect URI. `POST /api/auth/token` validates the client secret, the registered
+redirect URI, the PKCE verifier, expiry, and one-time use before returning the
+Workspace identity. Registration is deployment-supplied via `OAUTH_CLIENTS_JSON`.
+External browser clients should use `clientType: "public"`, PKCE, and `requiresConsent: true`; they omit `clientSecret` and use an exact registered callback URL. The local Workspace Agent callback is `http://127.0.0.1:3101/auth/oauth/callback`. Internal service clients may remain confidential and use the existing no-consent behavior.
+
+The Agent client is not enabled by default: the entry in `.env.example` is only a
+commented example. For the exact active configuration and the local server, browser,
+account registration, and Agent connection steps, see
+[Connect to a local Workspace](../agent/README.md#connect-to-a-local-workspace).
+
+Existing Workspace login, OAuth callbacks, Cookie behavior, and product APIs
+remain unchanged. The capability is additive and does not add a proxy or
+deployment component.
+
+When the granted scope includes `session` (a scope the deployment registers
+per client), the token response also carries a Workspace login session token
+in `access_token` with its remaining lifetime in `expires_in`. The client
+presents that value as the `workspace_session` cookie on product and
+collaboration endpoints and acts with the authorizing User's permissions
+until the session expires; there is no refresh grant, so an expired token
+means starting the authorization flow again. Granting `session` is a
+deployment trust decision made at client registration, which is why code
+issuance itself stays silent exactly like identity-only grants.
+
+The browser uses the same built-in runtime development license as Workspace
+CLI. Both copies are rotated every 90 days and are application credentials, not
+the repository software license. The built-in credential is for `localhost`;
+set `VITE_UNIVER_LICENSE` at build time for any non-local deployment or to
+override it locally. Server, database, GitHub, and Discord settings are runtime
+values.
+
+An authenticated Browser keeps one `/api/worktree-events` WebSocket open. AI or
+CLI Worktree writes publish a cache-invalidation signal only after the combined
+Collaboration and product operation completes, so active/processed task lists,
+details, sidebar counts, and Worktree-driven Node/Resource lists refresh without
+a page reload. The connection uses a one-time session ticket and carries no
+Worktree metadata or content.
+
+## Docker
+
+Build the image from the repository root:
+
+```bash
+docker build \
+  --build-arg VITE_UNIVER_LICENSE="$VITE_UNIVER_LICENSE" \
+  -f apps/workspace/Dockerfile \
+  -t univer-workspace .
+```
+
+Run it with a persistent data volume:
+
+```bash
+docker run --name univer-workspace \
+  -p 3020:3020 \
+  -v univer-workspace-data:/app/univer-workspace/.data \
+  -e GITHUB_CLIENT_ID \
+  -e GITHUB_CLIENT_SECRET \
+  -e GITHUB_CALLBACK_URL=https://workspace.example.com/api/auth/github/callback \
+  -e GITHUB_ALLOWED_ORGANIZATIONS \
+  -e DISCORD_CLIENT_ID \
+  -e DISCORD_CLIENT_SECRET \
+  -e DISCORD_CALLBACK_URL=https://workspace.example.com/api/auth/discord/callback \
+  -e OAUTH_CLIENTS_JSON \
+  -e SECURE_COOKIES=true \
+  univer-workspace
+```
+
+For a plain HTTP environment, use `-e SECURE_COOKIES=false`. Keep secure
+cookies enabled when the deployment is served over HTTPS.
+
+To intentionally erase all product and collaboration data in a disposable
+environment, run the reset command against the volume:
+
+```bash
+docker run --rm \
+  -v univer-workspace-data:/app/univer-workspace/.data \
+  univer-workspace node dist/server/db/reset.js
+```
+
+Starting or restarting the application does not recreate the database.
+Do not run the reset command during a normal deployment; application startup
+backs up and migrates supported V0 through V11 product databases to V12 automatically.
+While the container runs, touch its SQLite files only from inside it
+(`docker exec … node`). The product database is in WAL mode: opening it from
+the host with another SQLite build — even just to read it — can corrupt the
+file. Stop the container before inspecting or copying `.data`.
+SDK 1.0.0 upgrades Collaboration components to `core=2`, `worktree=3`, and
+`history=2`; `comment=1` is unchanged. Product V12 adds Space slugs and Worktree numbers; V11 added the Space description; V10 added Space stars; V9 added
+Issue tables and V8 added content-permission tables. Before creating
+application Services, the server entry point prepares the Collaboration file:
+
+1. Stop **all** old Workspace writers and back up both SQLite files and Blob storage.
+   With Kubernetes, use a single replica with the `Recreate` strategy for this rollout.
+2. Start a single new instance. Startup first prepares the product database to V12,
+   then reads the Collaboration component versions. If migration is needed, it takes
+   an exclusive lock, checks the source file's integrity and foreign keys, and
+   creates a consistent
+   `<collaboration-file>.pre-sdk-1.0.0-<timestamp>-<uuid>.bak` beside the database.
+   If another process still has a WAL-mode file open, or holds any lock on it,
+   startup fails before the backup. An idle rollback-journal connection holds no
+   lock and cannot be detected, so step 1 remains required.
+3. The published SDK migrations run on a staging copy in Core → Worktree → History
+   order while the lock is held. Schema validation, `foreign_key_check`, and
+   `integrity_check` must pass before the copy atomically replaces the original.
+   A failed migration leaves the original database, its journal mode, and the
+   backup available; startup fails before accepting traffic.
+4. Verify startup and document/Worktree access, then restore normal service.
+   Subsequent startups read the component versions without rerunning the full
+   integrity and foreign-key scans, migrations, or backup.
+
+Core V1, Worktree V1/V2, and History V1 are supported; fresh files are initialized
+by the current Adapters. Unit creator and creation time come from History V1
+revision 1, then from the product database: the Trunk Node for a Unit, or the
+Worktree node intent for a Unit created in a Worktree. Only when both lack a value
+does the migration use `anonymous` and the migration time; these values are
+fallbacks, not reconstructed authorship. Changeset times keep the SDK defaults.
+Custom server entry points must prepare the product database and then await
+`prepareCollaborationDatabase(collaborationFile, productFile)` before
+constructing `createWorkspaceApplication` for an existing database.
+Never run old and new SDK writers together. To roll back, stop the new instance
+and restore the matching pre-upgrade product/Collaboration/Blob backups; changing
+only the application image is insufficient. Retain backups until rollout is accepted.
+V7 extends the Operation kind and object deletion reason for Blob replacement; existing
+Blob rows and upload sessions are preserved.
+V8 adds content permission objects and collaborators without rewriting existing tables.
+V9 adds Space-scoped Issues, comments, events, labels, assignees and file references
+without rewriting existing tables.
+V10 adds `space_stars` without changing existing Space, content, Blob or recovery rows.
+V11 adds `spaces.description TEXT NOT NULL DEFAULT ''`; existing Spaces get the empty
+description and no other row changes. The description is plain text of at most 350
+characters, trimmed on write, and editable by users who can rename the Space.
+V12 adds `spaces.slug` and `worktrees.number` (both nullable) with partial unique
+indexes; no existing row is rewritten. Spaces and Worktrees created before V12 keep
+`NULL` and are addressed by ID; an administrator can set a slug for an old Team Space
+in Settings. A Team Space slug is unique per owner (case-insensitive) and, with the
+owner's username, forms `owner/slug`; every Personal Space is `owner/personal`.
+Team Worktrees share the Space's `#N` sequence with Issues.
+For a V12 rollout, stop every old Workspace instance, start one V12 instance and
+wait for migration and health checks to succeed, then restore normal service;
+do not let V11 and V12 processes write the same SQLite file concurrently.
+Startup creates and validates a `.v11-backup-…sqlite` backup before the V11 → V12
+transaction. A failed step rolls back; subsequent successful startups do not
+repeat migration or backup. Rollback requires stopping V12 and restoring the
+pre-upgrade product backup, not just running the old application image.
+Deploy the Workspace server before upgrading `univer-workspace-cli` to a release that
+addresses repositories by `owner/slug`.
+
+### Repository stars
+
+Repository view shares GitHub-style navigation and a Star / Unstar control across
+Space-scoped pages. Stars belong to the authenticated User and the existing Space,
+persist across refresh and restart, and never grant access. The product API exposes
+`GET`, `PUT` and `DELETE /api/spaces/{spaceId}/star`; writes are idempotent and all
+three return `{ starred, starCount }`. All require login and current Space access.
+`SpaceView.owner` supplies the existing owner's ID and username for the breadcrumb.
+Watch, Fork, star lists and GitHub-only tabs are not provided. See the
+[comparison and verification record](docs/proposals/repository-framework-star.md).
+
+Repository Pull requests use the existing Worktree workflow. The list keeps Open/Closed
+filters and adds local text search; details place the summary and review actions in
+Overview, with document selection, draft viewing and comparison in Files changed.
+Wiki and the global Workbench retain their existing dashboard. No GitHub PR model,
+comments, branches or checks are introduced. See the
+[reference, feature mapping and verification](docs/proposals/repository-pull-requests-tab.md).
+
+Repository Settings uses grouped sidebar navigation and separate name/description saves,
+with confirmed public-read changes in Danger Zone. Collaborator management and Trash keep
+their existing permissions and APIs. See the
+[comparison, remaining differences and verification](docs/proposals/repository-settings-tab.md).
+
+Repository Pages keeps its existing page directory, browser-local default selection, copy and
+visit actions, styled after the published Jekyll Primer theme rather than Pages settings.
+The repository header and tab order stay unchanged. See the
+[reference, differences and verification](docs/proposals/repository-pages-tab.md).
+
+The manual `Deploy Workspace` workflow accepts an optional existing stable `vX.Y.Z`
+repository tag. When provided, it checks out that tag and uses it for the container
+image. When omitted, it builds the workflow dispatch commit and tags the image as
+`sha-<commit>`. It then hands the image to the selected environment. A tag push does
+not deploy Workspace automatically, and the deployment workflow does not publish the
+CLI.
+
+### Startup diagnostics
+
+Startup emits synchronous JSON lines to stdout with `event: "workspace.startup"`,
+`startupId`, `stage`, and `status` (`started`, `completed`, or `failed`). These
+bounded diagnostics are always emitted, independently of `LOG_LEVEL`, so module
+loading and synchronous migration failures can be located even before HTTP starts.
+Each line includes stage `elapsedMs`, process `uptimeMs`, `memory` (Node memory
+usage in bytes, including `rss`, `heapUsed`, `heapTotal`, `external`, and
+`arrayBuffers`) and V8 `heapSizeLimit` in bytes. Configuration values, document
+contents and credentials are not included.
+
+Stages cover module loading, configuration, product and Collaboration database
+preparation, application creation/initialization, background jobs, WebSocket setup
+and HTTP listening. Migration sub-stages identify backup, creation-fact loading,
+Core/Worktree/History upgrades, validation and publication of the staging copy.
+In Grafana Loki, use `{container="colla-workspace"} | json | event="workspace.startup"`
+and select the affected Pod. For an OOM, inspect the last `started` stage without
+a matching `completed`/`failed` within the same `startupId`; a fatal OOM cannot
+reliably emit a failure record. Stage memory values are boundary samples, not peak
+measurements, and there is no timer-based progress log during blocking SDK work.
+
+## Commands
+
+```bash
+pnpm typecheck
+pnpm test
+pnpm build
+pnpm db:reset
+```
+
+See [architecture.md](docs/architecture.md), [data-model.md](docs/data-model.md),
+and [application-design.md](docs/application-design.md).
+
+### Worktree discovery API
+
+`GET /api/worktrees` returns a cursor-paginated summary page (`items`, `nextCursor`).
+It defaults to active Worktrees ordered by product update time. `scope=processed`
+loads history and `scope=all` includes both; `kind=user` selects the current user's
+personal Worktrees, while `kind=team&teamSpaceId=<id>` selects one Team Space.
+Omitting the ownership filters provides the current user's accessible overview
+across Spaces without changing visibility or content permissions.
+
+Use `limit` (1–200, default 50), `order=createdAtDesc` for creation order, and
+`search` (up to 200 characters) for a literal substring in names, summaries,
+creator names, or Team Space names. Search is ASCII case-insensitive; other
+characters match exactly. Visibility and search are applied before pagination.
+Pass `nextCursor` as `cursor` with the same filters and order until it is null.
+Each page reflects current data; refresh the first page after lifecycle changes.
+Summary `unitCount` includes all mapped Units, not only changed documents.
+Fetch `/api/worktrees/<id>` only when Unit details are needed.
+
+### Blob replacement
+
+Blob content can be replaced while preserving its Resource identity and location.
+Replacement requires the downloaded ETag and publishes immediately, without Worktree
+review. See the [HTTP contract](contracts/http/concepts.md#resource-creation-and-opening)
+for preconditions and retry behavior.
+
+## 沉浸视图
+
+所有资源页面支持 `?view=immersive`。点击“进入沉浸视图”在当前页隐藏 Workspace 顶栏和侧栏；
+Ctrl / Command 点击、中键和右键菜单沿用浏览器的链接行为。浏览器后退可返回进入前的页面。
+直接打开分享链接时，返回行为沿用浏览器的历史记录；不额外提供页面内退出控件或快捷键。
+
+视图参数可随链接分享，刷新和登录跳转后保留。分享弹窗在复制链接旁提供“沉浸视图”复选框，
+按当前 `node.name` 判断：Blob 文件名以 `.univer.html` 结尾时默认勾选，其他资源默认不勾选。该选择只影响链接展示，不修改权限。
+沉浸视图不调用浏览器原生全屏，也不移除资源自身的编辑工具。
+
+HTML 不显示独立的加载、保存或同步状态提示，错误仍可见。
+同一资源切换视图不会重建编辑器或触发 HTML 离开保存保护；
+真正离开资源仍执行原有保存流程。
+
+独立预览（实际资源页面，内存示例数据，无需后端）：
+
+```bash
+pnpm --filter @univerjs/univer-workspace exec vite --config test/vite.immersive.config.ts
+```
+
+打开 `http://127.0.0.1:5183/nodes/html` 或 `http://127.0.0.1:5183/nodes/text`。
+
+## Anonymous viewing
+
+Anyone with a Node link can view its content when Link Sharing is enabled or its
+Space has public read enabled. Folder sharing includes current and future children;
+Space public read allows browsing that Space by URL. Anonymous visitors always have
+viewer access, even when a link grants editors access after sign-in. They cannot
+modify content, write comments, upload, manage permissions, or access Worktrees.
+HTML files and their source Sheets are authorized independently, as for signed-in users.
+
+These rules apply to existing enabled settings after upgrade. No anonymous accounts,
+login sessions, Recent entries, schema changes or database migration are introduced.
+The public link uses the existing Node URL, including immersive-view parameters.
+Each read request and Unit join checks current permissions. Link Sharing changes
+retain the existing realtime connection invalidation. Space public-read changes,
+Node moves and deletion do not add active-connection eviction; existing subscriptions
+may continue receiving updates until disconnected. Reconnecting readers are authorized again.
+
+## HTML-native Office previews
+
+Browser `.univer.html` files can call `window.univerWorkspace.showUnit(unitId, slot)`
+to open a live Sheet, Doc or Slides with server-authorized editing inside their layout, while keeping
+HTML cell bindings active. Each target is independently authorized; sharing the
+HTML does not share its source files. `hideUnit()` closes the preview, and the
+host's **Open file** action leads to the standard editor. Stable paragraph, cell
+and slide navigation are supported. See the [page API and limits](../../docs/design/html-views/native-preview.md).
+
+### Unit content edit protection
+
+Sheet, Doc, Slide, Board and Base use the SDK protection UI and server mutation analysis.
+Editors create protections; their creator and current Owner/Admin manage them. Worktrees
+inherit current Trunk policy and cannot manage bindings or collaborators. Content remains
+readable under the existing file permissions, including snapshots, history and exports.
+See [validation and release gate](docs/content-permissions-validation.md).

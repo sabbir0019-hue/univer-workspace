@@ -1,0 +1,684 @@
+import { isWorkspaceLoginRequired, startWorkspaceLogin } from "./workspace-login.tsx";
+import { createLocalPathInputSource, pathReferenceInsert, type PathReference } from "./path-reference.ts";
+import { bindContentRoute, regionQuery } from "./navigation/region-route.ts";
+import { invalidateWorkspaceState } from "./api/univer-api.ts";
+/**
+ * @dsh-univer-workspace-plugin — browser half.
+ *
+ * Mirrors the dsh-univer-office client surface for remote Workspace
+ * documents: the native DSH workspace picker in the blank-session hero, the Turn-tail
+ * review panels (one per touched document), and floating live-editor
+ * windows in the input dock, backed by one locale namespace. All
+ * collaboration traffic goes through the same-origin proxy (no iframe).
+ */
+import type { ClientContext, ISessions, WorkspaceView } from "./dsh-runtime-types.ts";
+import type {} from "@deepseek-ai/dsh-client-locale/client";
+import type {} from "@deepseek-ai/dsh-client-ui-slots";
+import type {} from "@deepseek-ai/dsh-client-ui-conversation/client";
+import type {} from "@deepseek-ai/dsh-client-ui-chat/client";
+import type {} from "@deepseek-ai/dsh-client-ui-sidebar/client";
+import type {} from "@deepseek-ai/dsh-client-ui-layout/client";
+import type {} from "@deepseek-ai/dsh-client-ui-settings/client";
+import type { IConversation } from "@deepseek-ai/dsh-client-ui-conversation/client";
+import { WorkspaceUserMessageNodeView } from "./WorkspaceUserMessageNodeView.tsx";
+import { toast } from "@univerjs/univer-workspace-ui";
+import "./index.css";
+import { PreviewCard } from "./components/preview-card.tsx";
+import { WORKSPACE_TOOL_NAMES, WorkspaceToolRow } from "./components/workspace-tool-row.tsx";
+import { ViewerDock } from "./ViewerDock.tsx";
+import { selectUniverTurn, univerTurnDefinition } from "./conversation/univer-turn-definition.ts";
+import { viewerLocaleOf, type ViewerLocale } from "./viewer-locale.ts";
+import { loadViewerBootstrap } from "./viewer-bootstrap.ts";
+import { en, UNIVER_LOCALE_NAMESPACE, zh } from "./locales.ts";
+import { SpaceDirectoryFlow } from "./SpaceDirectoryFlow.tsx";
+import { TemplateForkAction } from "./TemplateForkAction.tsx";
+import { WorkspaceFooterSwitch } from "./WorkspaceSwitchButton.tsx";
+import { DesktopSettings } from "./DesktopSettings.tsx";
+import { WorkspaceOnboarding, WorkspaceLoginAction } from "./WorkspaceOnboarding.tsx";
+import { OriginSetting, type WorkspaceAuthSettings } from "./OriginSetting.tsx";
+import { HarnessDocumentTitle } from "./DocumentTitle.tsx";
+import { WorkspaceSidecar, WorkspaceSidecarTitle, WORKSPACE_SIDECAR_KIND } from "./WorkspaceSidecar.tsx";
+import { addWorkspaceSpace, fetchWorkspaceSpaces, renameWorkspaceSpace } from "./space-api.ts";
+import { localizeWorkspaceNames } from "./space-name.ts";
+import { WorkspaceSidebarRoot } from "./WorkspaceSidebarRoot.tsx";
+import {
+  createWorkspaceNavigationStore,
+  workspaceNavigationModeOf,
+} from "./navigation/workspace-navigation.ts";
+import { forkTemplate } from "./template-api.ts";
+import { WORKSPACE_ME_PATH, type WorkspaceMeView } from "./workspace-contract.ts";
+import {
+  createWorkspaceResourceInputSource,
+  bindReferenceDraftRestoration,
+  fetchWorkspaceResourceDescriptor,
+  insertWorkspaceResourceReference,
+  insertWorkspaceReference,
+  WORKSPACE_RESOURCE_REFERENCE_SOURCE,
+  type WorkspaceResourceDescriptor,
+  type WorkspaceResourceReferenceInsertResult,
+} from "./workspace-resource-reference.ts";
+
+/** Required browser services. */
+export const inject = [
+  "slots",
+  "uiConversation",
+  "conversation",
+  "inputTriggers",
+  "locale",
+  "settingsScope",
+  "sessions",
+  "workspaces",
+  "uiWorkspace",
+  "layout",
+  "sidebarRight",
+  "sidebarRightTabs",
+];
+
+const WORKSPACE_SETTINGS_NAMESPACE = "univer-workspace-harness";
+
+/** Apply the browser plugin. */
+export function apply(ctx: ClientContext): void {
+  ctx.effect(() => {
+    window.addEventListener("uwh:workspace-changed", invalidateWorkspaceState);
+    return () => window.removeEventListener("uwh:workspace-changed", invalidateWorkspaceState);
+  });
+  let storedNavigationMode: string | null = null;
+  try {
+    storedNavigationMode = window.localStorage.getItem("dsh-univer-workspace/sidebar-tab");
+  } catch {
+    /* optional preference */
+  }
+  const navigation = createWorkspaceNavigationStore({
+    navigationMode: workspaceNavigationModeOf(storedNavigationMode),
+    contentSurface: null,
+  });
+
+  ctx.effect(
+    () => ctx.locale.register(UNIVER_LOCALE_NAMESPACE, { zh, en }),
+    "univer-workspace: dictionaries",
+  );
+  const translate = ctx.locale.bind(UNIVER_LOCALE_NAMESPACE);
+  const clientSessions = ctx.sessions as unknown as ISessions;
+  const services = ctx as unknown as { get: (name: string) => unknown };
+  const conversation = services.get("conversation") as IConversation;
+  ctx.effect(
+    () => bindReferenceDraftRestoration({ sessions: clientSessions, conversation }),
+    "univer-workspace: Restore reference drafts",
+  );
+  let linkedSpaces: Awaited<ReturnType<typeof fetchWorkspaceSpaces>> = [];
+  let invalidateSpaceNames = () => {};
+  ctx.effect(() => {
+    const names = localizeWorkspaceNames(
+      ctx.workspaces.list,
+      () => linkedSpaces,
+      () => translate("workspace.personalSpaceName"),
+      listener => ctx.locale.subscribe(listener),
+    );
+    invalidateSpaceNames = names.invalidate;
+    return names.dispose;
+  }, "univer-workspace: localized Space names");
+  let currentSpaceIdForSession: ((sessionId: string) => string | undefined) | undefined;
+  const inputTriggers = services.get("inputTriggers") as {
+    registerSource: (source: ReturnType<typeof createWorkspaceResourceInputSource>) => () => void;
+  };
+  ctx.effect(
+    () =>
+      inputTriggers.registerSource(
+        createWorkspaceResourceInputSource(
+          undefined,
+          {
+            workspace: translate("workspace.workspace"),
+            browseWorkspace: translate("resource.browseWorkspace"),
+            personalSpace: translate("workspace.personalSpace"),
+            teamSpace: translate("workspace.teamSpace"),
+            retry: translate("resource.retry"),
+          },
+          (sessionId) => currentSpaceIdForSession?.(sessionId),
+        ),
+      ),
+    "univer-workspace: Resource @ source",
+  );
+
+  ctx.effect(
+    () =>
+      inputTriggers.registerSource(
+        createLocalPathInputSource({
+          localFiles: translate("reference.localFiles"),
+          host: translate("reference.hostFiles"),
+          truncated: translate("reference.truncated"),
+        }),
+      ),
+    "univer-workspace: Local path @ source",
+  );
+
+  const openMessageResource = async (resourceId: string): Promise<void> => {
+    try {
+      const [resource, me] = await Promise.all([
+        fetchWorkspaceResourceDescriptor(resourceId, new AbortController().signal),
+        loadMe(),
+      ]);
+      navigation.dispatch({
+        type: "open-content",
+        contentSurface: {
+          kind: "resource",
+          workspaceOrigin: me.workspaceOrigin,
+          resourceId: resource.resourceId,
+          docKey: `res:${resource.resourceId}`,
+          name: resource.name,
+          unitType: resource.unitType,
+        },
+      });
+    } catch (error) {
+      toast.error(translate("window.loadFailed"), {
+        description: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
+
+  // Keep DSH's native message chrome, but project Workspace Resource wire
+  // objects to readable file chips in the transcript. The underlying node and
+  // model payload remain unchanged; this is a display-only seat replacement.
+  ctx.slots.inject("conversation.chat.node", () =>
+    ctx.slots.register(
+      {
+        name: "conversation.chat.node",
+        key: "user",
+        priority: -100,
+        inject: () => ({ onOpenResource: openMessageResource }),
+      },
+      WorkspaceUserMessageNodeView,
+    ),
+  );
+  ctx.slots.inject("conversation.chat.node", () =>
+    ctx.slots.register(
+      {
+        name: "conversation.chat.node",
+        key: "steering",
+        priority: -100,
+        inject: () => ({ onOpenResource: openMessageResource }),
+      },
+      WorkspaceUserMessageNodeView,
+    ),
+  );
+
+  const finishReferenceInsert = (
+    sessionId: string | undefined,
+    result: WorkspaceResourceReferenceInsertResult,
+  ): WorkspaceResourceReferenceInsertResult => {
+    switch (result.kind) {
+      case "inserted":
+        if (sessionId !== undefined) openSession(sessionId);
+        toast.success(translate("resource.addedToMessage"));
+        break;
+      case "input-busy":
+        toast.error(translate("resource.inputBusy"));
+        break;
+      case "session-unavailable":
+        toast.error(translate("resource.sessionUnavailable"));
+        break;
+      case "input-changed":
+        toast.error(translate("resource.inputChanged"));
+        break;
+    }
+    return result;
+  };
+  const insertResourceReference = (
+    sessionId: string | undefined,
+    resource: Pick<WorkspaceResourceDescriptor, "resourceId" | "name">,
+    selection?: import("./viewer/contracts.ts").ViewerSelection,
+  ): WorkspaceResourceReferenceInsertResult => {
+    const result = insertWorkspaceResourceReference(
+      { sessions: clientSessions, conversation },
+      sessionId ?? "",
+      resource,
+      selection,
+    );
+    return finishReferenceInsert(sessionId, result);
+  };
+  const insertFolderReference = (
+    sessionId: string | undefined,
+    folder: Extract<PathReference, { kind: "workspace-folder" }>,
+  ) =>
+    finishReferenceInsert(
+      sessionId,
+      insertWorkspaceReference(
+        { sessions: clientSessions, conversation },
+        sessionId ?? "",
+        pathReferenceInsert(folder, WORKSPACE_RESOURCE_REFERENCE_SOURCE),
+      ),
+    );
+
+  const workspaceNavigation = ctx.uiWorkspace as unknown as {
+    startSession: (workspaceId?: string) => void;
+  };
+
+  // Replace only the shell root; native DSH session browser and settings stay
+  // behind their existing slots while the Workspace file tree gets a second tab.
+  ctx.slots.inject("sidebar", () =>
+    ctx.slots.register(
+      {
+        name: "sidebar",
+        priority: -1,
+        locale: UNIVER_LOCALE_NAMESPACE,
+        children: {
+          "sidebar.brand.mark": { kind: "single", scope: "root" },
+          "sidebar.brand.name": { kind: "single", scope: "root" },
+          "sidebar.workspaces": { kind: "single", scope: "root" },
+          "sidebar.settings": { kind: "single", scope: "root" },
+          "sidebar.footer.action": { kind: "list", scope: "root" },
+        },
+        inject: () => ({
+          startSession: (workspaceId?: string) => {
+            workspaceNavigation.startSession(workspaceId);
+          },
+          toggleSidebar: () => {
+            ctx.layout.toggleSidebar();
+          },
+          navigation,
+          insertResourceReference,
+          insertFolderReference,
+          translate,
+          getWorkspaceFileLocale: () => viewerLocaleOf(ctx.locale.getSnapshot().active),
+          subscribeWorkspaceLocale: (listener: () => void) => ctx.locale.subscribe(listener),
+        }),
+      },
+      WorkspaceSidebarRoot,
+    ),
+  );
+
+  const workspaces = ctx.workspaces as unknown as {
+    rename: (workspaceId: string, title: string) => Promise<WorkspaceView>;
+    list: {
+      getSnapshot: () => {
+        items: readonly { workspaceId: string; sessionIds: readonly string[] }[];
+      };
+    };
+  };
+  const nativeRenameWorkspace = workspaces.rename.bind(workspaces);
+  let spacesPromise: Promise<Awaited<ReturnType<typeof fetchWorkspaceSpaces>>> | undefined;
+  const loadSpaces = (): Promise<Awaited<ReturnType<typeof fetchWorkspaceSpaces>>> => {
+    if (spacesPromise === undefined) {
+      spacesPromise = fetchWorkspaceSpaces()
+        .then((spaces) => {
+          linkedSpaces = spaces;
+          invalidateSpaceNames();
+          return spaces;
+        })
+        .catch((reason: unknown) => {
+          spacesPromise = undefined;
+          throw reason;
+        });
+    }
+    return spacesPromise;
+  };
+  currentSpaceIdForSession = (sessionId: string): string | undefined => {
+    const workspaceId = workspaces.list
+      .getSnapshot()
+      .items.find((item) => item.sessionIds.includes(sessionId))?.workspaceId;
+    if (workspaceId === undefined) return undefined;
+    return linkedSpaces.find((space) => String(space.dshWorkspaceId) === String(workspaceId))
+      ?.spaceId;
+  };
+  // Load the remote catalogue for labels and references. Browsing never adds
+  // Spaces to the local DSH session list.
+  ctx.effect(() => {
+    let active = true;
+    void fetchWorkspaceSpaces().then(spaces => {
+      if (!active) return;
+      linkedSpaces = spaces;
+      invalidateSpaceNames();
+    }).catch(() => {
+      // The picker exposes connection and loading errors when opened.
+    });
+    return () => { active = false; };
+  }, "univer-workspace: Space catalogue");
+  workspaces.rename = async (workspaceId, title): Promise<WorkspaceView> => {
+    const spaces = await loadSpaces();
+    const linked = spaces.find((space) => String(space.dshWorkspaceId) === String(workspaceId));
+    if (linked === undefined) return nativeRenameWorkspace(workspaceId, title);
+    const result = await renameWorkspaceSpace(linked.spaceId, title);
+    spacesPromise = undefined;
+    return nativeRenameWorkspace(workspaceId, result.space.name);
+  };
+  ctx.effect(
+    () => () => {
+      workspaces.rename = nativeRenameWorkspace;
+    },
+    "univer-workspace: linked Space rename",
+  );
+
+  let mePromise: Promise<WorkspaceMeView> | undefined;
+  const loadMe = (): Promise<WorkspaceMeView> => {
+    if (mePromise === undefined) {
+      mePromise = fetch(WORKSPACE_ME_PATH, { headers: { accept: "application/json" } })
+        .then(async (response) => {
+          if (response.status === 401) {
+            throw new Error("workspace_connection_required");
+          }
+          if (!response.ok) throw new Error("identity_failed");
+          const value = (await response.json()) as Partial<WorkspaceMeView>;
+          if (
+            typeof value.workspaceOrigin !== "string" ||
+            !Array.isArray(value.templates) ||
+            typeof value.connected !== "boolean" ||
+            typeof value.switching !== "boolean"
+          ) {
+            throw new Error("identity_failed");
+          }
+          return value as WorkspaceMeView;
+        })
+        .catch((reason: unknown) => {
+          mePromise = undefined;
+          throw reason;
+        });
+    }
+    return mePromise;
+  };
+
+  const reportViewerError = (error: unknown): void => {
+    if (isWorkspaceLoginRequired(error)) {
+      toast.error(translate("settings.workspace.login"), {
+        description: translate("file.authBody"),
+        action: { label: translate("settings.workspace.login"), onClick: () => {
+          void startWorkspaceLogin().catch(() => toast.error(translate("settings.workspace.loginFailed")));
+        } },
+      });
+      return;
+    }
+    toast.error(translate("window.loadFailed"), {
+      description: error instanceof Error ? error.message : String(error),
+    });
+  };
+
+  ctx.effect(() =>
+    bindContentRoute(
+      navigation,
+      async (route, signal) => {
+        const me = await loadMe();
+        if (!me.connected) throw new Error("workspace_connection_required");
+        if (route.kind === "worktree")
+          return {
+            kind: "worktree",
+            workspaceOrigin: me.workspaceOrigin,
+            worktreeId: route.id,
+            unitId: route.unitId,
+            name: route.id,
+          };
+        if (route.kind === "blob")
+          return {
+            kind: "blob",
+            workspaceOrigin: me.workspaceOrigin,
+            resourceId: route.id,
+            name: route.id,
+            mediaType: "application/octet-stream",
+            byteSize: null,
+          };
+        const resource = await fetchWorkspaceResourceDescriptor(route.id, signal);
+        return {
+          kind: "resource",
+          workspaceOrigin: me.workspaceOrigin,
+          resourceId: resource.resourceId,
+          docKey: `res:${resource.resourceId}`,
+          name: resource.name,
+          unitType: resource.unitType,
+        };
+      },
+      reportViewerError,
+    ),
+  );
+
+  const getViewerLocale = (): ViewerLocale => viewerLocaleOf(ctx.locale.getSnapshot().active);
+  const sessionHashForId = (sessionId: string): string => {
+    const query = new URLSearchParams(
+      window.location.hash.startsWith("#/?") ? window.location.hash.slice(3) : "",
+    );
+    query.set("right", `session/${encodeURIComponent(sessionId)}`);
+    return `#/?${query}`;
+  };
+  const openSession = (sessionId: string): void => {
+    clientSessions.open(sessionId as Parameters<typeof clientSessions.open>[0]);
+    window.location.hash = sessionHashForId(sessionId);
+  };
+
+  const spaceFlowInjected = () => ({
+    loadSpaces,
+    addSpace: async (spaceId: string) => {
+      const path = await addWorkspaceSpace(spaceId);
+      spacesPromise = undefined;
+      await loadSpaces();
+      return path;
+    },
+    t: translate,
+  });
+  ctx.slots.inject("conversation.hero.workspace.directoryFlow", () =>
+    ctx.slots.inject("sidebar.workspaces.directoryFlow", function* () {
+      yield ctx.slots.register(
+        {
+          name: "conversation.hero.workspace.directoryFlow",
+          priority: -100,
+          inject: spaceFlowInjected,
+        },
+        SpaceDirectoryFlow,
+      );
+      yield ctx.slots.register(
+        {
+          name: "sidebar.workspaces.directoryFlow",
+          priority: -100,
+          inject: spaceFlowInjected,
+        },
+        SpaceDirectoryFlow,
+      );
+    }),
+  );
+
+  const originScope = ctx.settingsScope.bind<WorkspaceAuthSettings>({
+    namespace: WORKSPACE_SETTINGS_NAMESPACE,
+  });
+  ctx.slots.inject("settings.onboarding", () =>
+    ctx.slots.register({
+      name: "settings.onboarding",
+      id: "univer-workspace-login",
+      order: -50,
+      locale: UNIVER_LOCALE_NAMESPACE,
+      inject: () => ({ scope: originScope, loadMe }),
+    }, WorkspaceOnboarding),
+  );
+  ctx.slots.inject("sidebar.footer.action", () =>
+    ctx.slots.register({
+      name: "sidebar.footer.action",
+      id: "univer-workspace-login",
+      order: -100,
+      locale: UNIVER_LOCALE_NAMESPACE,
+      inject: () => ({ loadMe }),
+    }, WorkspaceLoginAction),
+  );
+
+  ctx.slots.inject("settings.section", () => {
+    if (!window.workspaceDesktop) return () => {};
+    const register = () => ctx.slots.register({
+      name: "settings.section",
+      id: "univer-workspace-desktop-about",
+      order: 1000,
+      label: translate("desktop.about"),
+      locale: UNIVER_LOCALE_NAMESPACE,
+    }, DesktopSettings);
+    let dispose = register();
+    // Settings navigation projects registrant-localized labels from the ledger.
+    const unsubscribe = ctx.locale.subscribe(() => { dispose(); dispose = register(); });
+    return () => { unsubscribe(); dispose(); };
+  });
+
+  ctx.slots.inject("settings.general.item", () =>
+    ctx.slots.register(
+      {
+        name: "settings.general.item",
+        id: "univer-workspace-origin",
+        order: 100,
+        locale: UNIVER_LOCALE_NAMESPACE,
+        inject: () => ({ scope: originScope }),
+      },
+      OriginSetting,
+    ),
+  );
+
+  ctx.slots.inject("sidebar.footer.action", () =>
+    ctx.slots.register(
+      {
+        name: "sidebar.footer.action",
+        id: "univer-workspace-template-fork",
+        order: 5,
+        locale: UNIVER_LOCALE_NAMESPACE,
+        inject: () => ({ loadMe, forkTemplate, openSession }),
+      },
+      TemplateForkAction,
+    ),
+  );
+
+  const loadWorkspaceOrigin = async (): Promise<string | undefined> =>
+    (await loadMe()).workspaceOrigin;
+  ctx.slots.inject("sidebar.footer.action", () =>
+    ctx.slots.register(
+      {
+        name: "sidebar.footer.action",
+        id: "univer-workspace-open-workspace-footer",
+        order: 10,
+        locale: UNIVER_LOCALE_NAMESPACE,
+        inject: () => ({ loadWorkspaceOrigin }),
+      },
+      WorkspaceFooterSwitch,
+    ),
+  );
+
+  ctx.slots.inject("shell.overlay", () =>
+    ctx.slots.register(
+      {
+        name: "shell.overlay",
+        id: "univer-workspace-document-title",
+        order: -1000,
+      },
+      () => <HarnessDocumentTitle sessionList={clientSessions.list} />,
+    ),
+  );
+
+  ctx.effect(() => ctx.sidebarRightTabs.register({
+    id: WORKSPACE_SIDECAR_KIND,
+    kind: WORKSPACE_SIDECAR_KIND,
+    title: () => translate("file.title"),
+  }));
+  ctx.slots.inject("sidebar.right.pane.tab.title", () =>
+    ctx.slots.register({
+      name: "sidebar.right.pane.tab.title",
+      key: WORKSPACE_SIDECAR_KIND,
+      inject: () => ({ t: translate }),
+    }, WorkspaceSidecarTitle),
+  );
+  ctx.slots.inject("sidebar.right.pane.tab", () =>
+    ctx.slots.register({
+      name: "sidebar.right.pane.tab",
+      key: WORKSPACE_SIDECAR_KIND,
+      inject: () => ({ loadViewerBootstrap, getViewerLocale, t: translate, insertResourceReference }),
+    }, WorkspaceSidecar),
+  );
+
+  ctx.effect(() => {
+    let disposed = false;
+    let generation = 0;
+    let previous = navigation.getSnapshot().contentSurface;
+    const open = async () => {
+      const target = navigation.getSnapshot().contentSurface;
+      const request = ++generation;
+      if (!target) return;
+      try {
+        // Initial deep links can resolve before DSH's catalog/navigation baseline.
+        for (let attempt = 0; clientSessions.list.getSnapshot().phase !== "ready"; attempt++) {
+          if (attempt === 200) throw new Error("Session navigation is not ready.");
+          await new Promise<void>((resolve) => window.setTimeout(resolve, 50));
+          if (disposed || request !== generation) return;
+        }
+        if (clientSessions.list.getSnapshot().current === undefined) {
+          const legacySession = regionQuery(window.location.hash).get("right")?.replace(/^hidden\//, "");
+          const sessionId = legacySession?.startsWith("session/") ? decodeURIComponent(legacySession.slice(8)) : undefined;
+          if (sessionId && clientSessions.list.getSnapshot().byId[sessionId]) {
+            clientSessions.open(sessionId as Parameters<typeof clientSessions.open>[0]);
+          }
+        }
+        if (clientSessions.list.getSnapshot().current === undefined) {
+          const spaces = await loadSpaces();
+          const registered = new Set(workspaces.list.getSnapshot().items.map(item => String(item.workspaceId)));
+          const workspaceId = spaces.find(space => space.dshWorkspaceId !== undefined && registered.has(space.dshWorkspaceId))?.dshWorkspaceId;
+          if (workspaceId === undefined) throw new Error(translate("workspace.addBeforePreview"));
+          const sessionId = await ctx.uiWorkspace.connectWorkspace(workspaceId as Parameters<typeof ctx.uiWorkspace.connectWorkspace>[0]);
+          if (disposed || request !== generation) return;
+          clientSessions.open(sessionId);
+        }
+        const ownerSession = clientSessions.list.getSnapshot().current;
+        // The session selection commits before React mounts its native panel seat.
+        for (let attempt = 0; attempt < 40; attempt++) {
+          await new Promise<void>((resolve) => window.setTimeout(resolve, 50));
+          if (disposed || request !== generation || clientSessions.list.getSnapshot().current !== ownerSession) return;
+          try {
+            ctx.sidebarRight.openTab(WORKSPACE_SIDECAR_KIND, { params: { target }, revealIfOpened: true });
+            return;
+          } catch (error) {
+            if (!(error instanceof Error) || error.message !== "sidebarRight: no session surface is mounted" || attempt === 39) throw error;
+          }
+        }
+      } catch (error) {
+        if (!disposed && request === generation) reportViewerError(error);
+      }
+    };
+    const unsubscribe = navigation.subscribe(() => {
+      const next = navigation.getSnapshot().contentSurface;
+      if (next === previous) return;
+      previous = next;
+      void open();
+    });
+    if (previous) void open();
+    return () => { disposed = true; generation++; unsubscribe(); };
+  });
+
+  ctx.uiConversation.events.register(univerTurnDefinition);
+
+  // Own the transcript row for every Univer tool.  The stock generic row
+  // derives its summary from raw arguments, which exposes opaque Workspace
+  // UUIDs even when the Host supplies a human presentCall title.
+  ctx.slots.inject("tool.call.toolview", function* () {
+    for (const key of WORKSPACE_TOOL_NAMES) {
+      yield ctx.slots.register(
+        {
+          name: "tool.call.toolview",
+          key,
+          locale: UNIVER_LOCALE_NAMESPACE,
+        },
+        WorkspaceToolRow,
+      );
+    }
+  });
+
+  ctx.slots.inject("conversation.chat.turnTail", () =>
+    ctx.slots.register(
+      {
+        name: "conversation.chat.turnTail",
+        priority: -10,
+        locale: UNIVER_LOCALE_NAMESPACE,
+        // Mount a lightweight recovery reader even when paged chat lacks this Turn's tools.
+        select: (owner) => selectUniverTurn(owner) ?? { turn: owner.turn.turn, files: [] },
+        inject: () => ({ loadViewerBootstrap, getViewerLocale, navigation }),
+      },
+      PreviewCard,
+    ),
+  );
+
+  ctx.slots.inject("conversation.input.dock", () =>
+    ctx.slots.register(
+      {
+        name: "conversation.input.dock",
+        id: "univer-workspace-viewer",
+        order: 400,
+        locale: UNIVER_LOCALE_NAMESPACE,
+        inject: () => ({ loadViewerBootstrap, getViewerLocale, navigation }),
+      },
+      ViewerDock,
+    ),
+  );
+}

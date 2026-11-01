@@ -1,0 +1,4 @@
+.data/
+.env
+dist/
+web/src/routeTree.gen.ts

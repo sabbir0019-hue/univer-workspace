@@ -1,0 +1,499 @@
+# Univer Workspace 数据模型
+
+状态：V12，已实现
+
+权威定义：`server/src/db/schema.sql`
+
+产品数据库使用 SQLite，开启 Foreign Key，Schema 版本为
+`PRAGMA user_version = 12`。本模型以 Node 表达树，以 Resource 表达稳定内容身份；
+Univer Unit 与 Blob 是 Resource 的两种互斥类型扩展，Unit 内嵌 Asset 不进入 Tree。
+
+Univer Unit 的 Snapshot、Changeset、Sheet Block、Resource 与 Worktree 草稿另存于
+`COLLABORATION_DATABASE_FILE` 指向的 Collaboration SQLite 文件，不属于产品数据库 V12
+Schema。当前 SDK 要求 Base `schemaVersion = 2`，每个 Table 都有唯一的系统字段
+`__record_id`，并把每条 Record ID 投影到该字段；Row/Column/Cell Map 是可从 Field 与 Record
+重建的派生数据。现有持久化 Base Snapshot 均使用该表示。
+
+五类 Unit 的 Thread Comment anchor 属于 Unit snapshot/changeset；评论正文、回复、solved
+状态与并发 generation 保存在同一文件的 `collaboration_comments` 表中，并由
+`collaboration_schema_versions` 的 `comment=1` 组件版本管理。Comment Adapter 首次启动时
+幂等创建该附加 Schema，不改变产品数据库，也不要求执行产品迁移命令。评论正文不分支：
+Trunk、Worktree 和 Merge Preview 读写同一份 `collaboration_comments` 数据；只有 anchor 作为 Unit
+resource 随 Worktree snapshot/changeset 分支与合并（见 application-design.md "评论与 Worktree"）。
+
+SDK 1.0.0 的 Collaboration SQLite 组件版本为 `core=2`、`worktree=3`、`history=2`
+和 `comment=1`。Core 与 Worktree 保存 Unit 创建者、创建时间及 changeset 提交时间；
+History 只保存 `collaboration_history_records` 分段索引，从 Core 权威事实与 changeset
+构造列表。SDK 自动订阅创建/编辑事件，并在 History 读取时追赶索引；Workspace 不再维护
+旧逐 revision 索引或启动 backfill。History 读取遵循 Unit 打开权限，恢复仍遵循内容编辑权限；
+Worktree 和 Merge Preview 不读取或写入 Trunk History。
+
+启动入口先将产品数据库准备到 V12，再在构造 Service/Adapter 前集中调用已发布 SDK 的
+Core V1→V2、Worktree V1→V2→V3 与 History V1→V2 迁移。部署先停止全部写入者；启动时对协同
+文件读取组件版本；仅需迁移时取得排他锁并一直持有到替换完成，其他进程仍打开 WAL 文件或持有锁时在备份前失败。迁移前检查源库完整性和外键，随后生成
+一致性备份，在副本上按 Core→Worktree→History 顺序迁移，保留旧 History 的创建事实供前两个组件
+使用；通过 Adapter Schema 校验、外键和完整性检查后原子替换文件，并保持原 journal mode。失败
+不发布副本，原文件和备份保留，启动失败。当前版本只读取组件版本，不重复执行完整性与外键全库扫描、迁移或备份。Unit 创建者与创建时间依次
+取自 History V1 revision 1、产品 Trunk Node（`univer_resources` → `nodes`）或 Worktree 新建
+Unit 的 `worktree_node_intents`；都缺失时才使用 SDK 的 `anonymous`/迁移时刻回退值，不能将其
+当作原始事实。changeset 时间沿用 SDK 默认规则。产品数据库为 V12，Blob/Asset 字节与产品恢复状态不参与协同 Schema 改写。
+回退必须停新实例并恢复配套升级前备份；不得让新旧 SDK 同时写同一文件。
+
+迁移阶段同步输出 `workspace.startup` 诊断日志（耗时与内存字节数），不记录数据内容，也不新增持久化状态或改变 Schema。阶段完成只表示该步骤返回；整体迁移成功仍以准备函数成功返回为准。
+
+## 核心关系
+
+```text
+Space
+  └── Node ──0..1── Resource
+       │                  ├── Univer Resource ──1── Unit ── Asset ── BlobStore Object
+       │                  └── Blob Resource ──1── BlobStore Object
+       ├── child Node
+       ├── Node Grant
+       ├── Node Link Sharing
+       └── Trash Batch
+
+User ── Recent Resource ── Resource
+User ── Space Star ── Space
+Team Space ── Issue ─┬── Issue Comment / Issue Event
+                     ├── Issue Label Link ── Issue Label
+                     ├── Issue Assignee ── User
+                     └── Issue Node Reference ── Node
+Worktree ── Worktree Unit ── Resource ID
+                         └── optional Node activation intent
+
+Univer Asset Upload ── publish ── Univer Asset
+Object Deletion Job ── idempotent delete ── BlobStore Object
+```
+
+核心约束：
+
+- Node 可以没有 Resource，作为纯组织节点。
+- 任意 Node 都可以挂子 Node；Resource 是否存在不影响树结构。
+- 当前 Node 与 Resource 是一对零或一：`resources.node_id UNIQUE NOT NULL`。
+- Resource 不保存名称或位置；Node 是名称、父子关系、权限、分享和回收站的权威来源。
+- `resources.kind` 为 `univer | blob`，创建后不可修改。
+- 每个 Resource 必须且只能有与 Kind 对应的扩展记录。
+- 本版本不包含快捷方式，也不为未来快捷方式预留字段。
+- Univer Asset 完全继承所属 Trunk Unit 或 Worktree Scope 的权限，不创建独立 Resource。
+
+## 身份与空间
+
+### `users`
+
+用户的稳定身份和公开资料。`username` 使用 `NOCASE UNIQUE`。
+
+### `password_credentials`
+
+本地密码凭据，与 User 一对一并随 User 删除。
+
+### `external_identities`
+
+外部身份映射。当前 Provider 只允许 GitHub；同一 Provider Subject 唯一，同一 User
+在一个 Provider 下最多一个身份。
+
+### `login_sessions`
+
+只持久化 Session ID、Secret Hash、User 和过期时间。原始 Cookie Secret 不入库。Browser
+授权 CLI 后会为 CLI 创建独立的普通 Session 行；十分钟内待确认的一次性授权请求仅存在于
+Server 进程内存，不进入产品数据库，进程重启后由用户重新发起。
+
+### `spaces`
+
+`type` 为 `personal | team`。一个 User 最多拥有一个 Personal Space。
+`public_read` 默认关闭；开启后，任意访问者（含匿名访客）无需 Membership 或 Node Grant 即可按
+`viewer` 浏览 Space 树并打开其中内容。已有更高权限优先，公开策略不授予任何写能力。
+`description` 是 Space 的纯文本简介（`TEXT NOT NULL DEFAULT ''`，修剪空白后至多 350 字符），
+空字符串表示未设置；仅有重命名 Space 能力的用户可修改，读取权限与 Space 本身一致。它不是 README，
+HTML 页面内容仍以 Blob 保存。
+
+`slug`（V12，`TEXT COLLATE NOCASE`，可空）是 Team Space 在 owner 名下的短名，规则为
+`[A-Za-z0-9._-]`、1–100 字符、首字符为字母或数字，不区分大小写，`(owner_user_id, slug)` 唯一
+（部分唯一索引 `spaces_owner_slug`，`slug IS NOT NULL`）。Personal Space 不存 slug，`personal` 为保留字，
+Trigger `spaces_slug_insert/update` 守护这两条不变量；格式与冲突在服务层校验并返回 400/409
+`SPACE_SLUG_TAKEN`。V12 之前创建的 Team Space 取 `NULL`，不回填，管理员可在 Settings 中设置。
+全名由服务端计算：`<owner.username>/<slug>`；Personal Space 一律为 `<owner.username>/personal`
+（经 `spaces_personal_owner` 解析，旧数据同样适用）。username 可修改，改名后旧全名失效，不保留重定向。
+
+### `space_members`
+
+仅用于 Team Space，角色为 `admin | editor | viewer`。Space Owner 不重复写入成员表；
+Trigger 阻止向 Personal Space 写成员或把 Owner 写成成员。
+
+### `space_stars`
+
+用户对已有 Space 的收藏关系：`space_id`、`user_id`、`created_at`（Unix 毫秒）。
+联合主键 `(space_id, user_id)` 防止重复收藏，两条外键均 `ON DELETE CASCADE`。
+Star 不创建 Repository、成员、ACL、Unit 或 Operation，不改变 Space 的所有权和可见性。
+总数从关系表实时计算，不在 Space 中维护冗余计数。Personal 和 Team Space 均支持。
+用户取消 Star 时删除自己的关系；失去访问权时保留关系但不能再读取或操作，重新获得访问权后恢复可见。
+三个 Star HTTP 方法均要求登录及服务端 Access Resolver 确认的当前 Space 访问权。
+数据仅用于此收藏功能，记录属于受保护的产品用户行为数据；HTTP 只返回当前用户状态与汇总计数，不提供收藏者列表。
+
+## Node 树
+
+### `nodes`
+
+| 字段 | 语义 |
+| --- | --- |
+| `id` | Canonical Node ID，也是树页面 URL 身份 |
+| `space_id` | 所属 Space |
+| `parent_id` | 父 Node；`NULL` 表示 Space 根级 |
+| `name` | 产品显示名称的唯一权威值 |
+| `created_by` | 创建者 |
+| `trash_batch_id` | 当前回收站批次；`NULL` 表示可见 |
+| `created_at` / `updated_at` | Unix 毫秒 |
+
+数据库 Trigger 保证非空 Parent 与 Child 在同一 Space，并阻止直接自指。应用层在 Move
+前额外检查整条后代链，阻止把 Node 移入自己的后代。
+
+`nodes_parent` 支持按 Space、Parent、回收站状态和名称分页；`nodes_trash` 支持回收站
+批次查询。
+
+Node 不包含 `kind`、`node_type` 或 `is_folder`。是否有内容只由对应 Resource 是否存在
+表达。
+
+## Resource 与类型扩展
+
+### `resources`
+
+| 字段 | 语义 |
+| --- | --- |
+| `id` | 稳定、不透明的 Resource ID |
+| `node_id` | 唯一所属 Node |
+| `kind` | `univer | blob`，不可变的判别字段 |
+| `created_at` / `updated_at` | Unix 毫秒 |
+
+Resource 是内容 API、Recent 和 Worktree 的产品身份。它不重复保存 Node 名称、Space
+或 Parent。
+
+### `univer_resources`
+
+| 字段 | 语义 |
+| --- | --- |
+| `resource_id` | Resource 主键和外键 |
+| `unit_id` | Univer Collaboration Unit ID，全局唯一 |
+| `unit_type` | `sheet | doc | slide | board | base` |
+
+### `blob_resources`
+
+保存 BlobStore `object_key`、原始文件名、服务端检测的 MIME、字节数、SHA-256、ETag 与
+`ready | quarantined` 可用状态。文件字节不进入 SQLite，Object Key 不返回客户端。前端
+根据 MIME 与原始文件扩展名选择预览组件；数据库不保存 Preview Kind。
+Markdown 只增加只读展示，不新增 Resource kind、Unit 或持久化字段。
+
+### `blob_upload_sessions`
+
+保存发布前的三段上传状态以及服务端预留的 Node/Resource/Object 身份。上传完成前不创建
+Node 和 Resource，因此 Tree 不会看见半成品。Complete 在一个产品事务中发布 Node、
+Resource 与 Blob 扩展并完成 Operation。单进程服务启动时会把中断在 `verifying` 的上传
+恢复为可重传状态；确定性临时对象会在重传、Abort 或过期清理时移除。
+
+### `univer_assets`
+
+保存 Unit 内嵌资源的稳定 Asset ID、Scope、Object Key、客户端声明的 MIME、字节数、SHA-256、
+ETag 和创建者。`worktree_id IS NULL` 表示 Trunk；非空时 Asset 只属于该 Worktree。Trunk Asset
+必须引用现有 `univer_resources.unit_id`，Worktree Asset 必须引用对应 `worktree_units`。
+
+Snapshot 只保存 Asset ID，不保存 Object Key、文件路径、短期地址或字节。Asset 不创建 Node，
+也不进入 Recent、分享或 Tree API。
+
+### `univer_asset_uploads`
+
+保存原生 Univer File API 上传的 `receiving | stored` 状态。行中预留 Asset/Object 身份并固化
+Unit Scope；字节完整写入 BlobStore 后记录 Hash 与 ETag，再在一个产品事务中发布
+`univer_assets` 并删除 Upload 行。启动恢复会发布完整的 `stored` 行，放弃不完整的
+`receiving` 行并写删除任务。
+
+### `object_deletion_jobs`
+
+BlobStore 与 SQLite 不能共享事务。Blob Abort/过期、Asset Upload 放弃和 Unit/Resource
+永久删除时，先在同一 SQLite 事务写通用删除 Outbox，再由后台 Worker 幂等删除对象并重试
+失败任务。V3 已将旧 `blob_deletion_jobs` 泛化为本表。
+
+## 权限与分享
+
+### `node_grants`
+
+Personal Space Node 的直接授权，角色为 `editor | viewer`。Grant 继承到当前和未来后代。
+主键为 `(node_id, user_id)`。Trigger 阻止授权 Space Owner 或在 Team Space 写 Direct
+Grant。
+
+### `node_link_sharing`
+
+Node 的链接分享策略，登录用户角色为 `editor | viewer`；匿名访客固定为 `viewer`。
+策略同样按 Node 祖先链继承。
+Trigger 限制它只用于 Personal Space。
+
+匿名读取以保留 ID `workspace:anonymous` 进入 Access Resolver，只使用 Space 公开可读与 Link Sharing；
+不创建 User、Login Session 或 Recent；匿名读取本身不新增持久化状态。
+
+登录用户的有效 Role 由 Access Resolver 每次按以下来源计算最高权限：
+
+1. Space Owner；
+2. Team Space Membership；
+3. Node 或祖先的 Direct Grant；
+4. Node 或祖先启用的 Link Sharing。
+
+已在 Trash 中的 Node/Resource 不可通过普通浏览或内容接口发现。Repository 不自行拼接
+权限；产品 HTTP 与 Collaboration Endpoint 共用同一 Access Resolver。
+
+## 最近访问
+
+### `recent_resources`
+
+主键为 `(user_id, resource_id)`，记录最后一次成功打开 Resource 的时间。仅内容 Open
+成功后 Upsert；浏览 Node、失败打开、Worktree Preview 和 Link Sharing 本身不写入。
+
+列表查询时 Join Resource 和 Node 获取当前名称与位置，因此 Rename/Move 后无需更新
+Recent 行。
+
+## 回收站
+
+### `trash_batches`
+
+记录一次以某个 Node 为根的 Trash 操作：
+
+- `root_node_id` 是批次根；
+- 该 Node 及当时未属于其他批次的后代写入相同 `nodes.trash_batch_id`；
+- Restore 清空相应 Node 的批次 ID并写 `restored_at`；
+- 永久删除先为后代 Blob 写删除 Outbox，再按后代顺序删除 Node；
+- 活跃 Worktree 引用 Resource 时阻止永久删除。
+
+删除根 Node 后 Trigger 删除对应批次记录。Node 的 Resource 不改变 Trash 边界。
+
+## Worktree
+
+### `worktrees`
+
+User Worktree 必须是 Private 且没有 Team Space；Team Worktree 必须绑定 Team Space。
+`processed_at` 标记已 Merge 或 Discard。
+
+`number`（V12，可空）是展示为 `#N` 的仓库级编号。Team Worktree 与同一 Team Space 的 Issue
+共用一个递增序列（`MAX(issues.number, team worktrees.number) + 1`，在 `BEGIN IMMEDIATE` 事务内分配，
+Issue 分配逻辑同样计入 Worktree）；User Worktree 在创建者名下单独编号，经创建者自己的 Personal Space 寻址。
+部分唯一索引 `worktrees_team_number`、`worktrees_user_number` 兜底。V12 之前创建的 Worktree 为 `NULL`，不回填，
+仍以 ID 寻址。Worktree 与 Issue 行只随 Space 级联删除，不会单独删除，因此编号不会复用。
+User Worktree 在 `owner/personal` 下的归属只用于编号与列表，不改变其内容或权限边界。
+创建在协同服务建立 Worktree 之后、同一产品事务内分配编号并插入产品行，幂等重试保留原编号。
+
+### `worktree_units`
+
+| 字段 | 语义 |
+| --- | --- |
+| `worktree_id`, `unit_id` | 复合主键 |
+| `resource_id` | 稳定产品内容身份 |
+| `source` | `trunk | worktree` |
+| `ordinal` | Worktree 内顺序 |
+| `added_at` | 加入时间 |
+
+`resource_id` 对 Trunk Unit 只允许指向已有 Univer Resource；Blob 第一版不进入 Worktree。
+对尚未激活的 Worktree-local Unit，它是预留 Resource ID，此时核心 `resources` 表中还没有
+对应行。
+
+### `worktree_node_intents`
+
+仅 Worktree-local Unit 使用，保存激活时要创建的：
+
+- 预留 `node_id`；
+- 目标 Space 和 Parent Node；
+- 名称与 Univer Unit Type；
+- 创建者；
+- Activated/Discarded 状态。
+
+激活在一个产品事务中创建 Node、Resource、Univer Resource，并标记 Intent。它不接受
+客户端指定 Node、Resource 或 Unit ID。
+
+## Issues
+
+Issue 只属于 Team Space，不保存 snapshot、changeset 或 revision，也不与 Worktree 关联（V1 不做）。
+所有写入都是单个 `BEGIN IMMEDIATE` 事务，不使用 Operation。权限从 Space 角色推导，不设 Issue 级 ACL；
+个人空间的 Issue 接口返回 409。
+
+### `issues`
+
+| 字段 | 语义 |
+| --- | --- |
+| `id` | 随机主键 |
+| `space_id`, `number` | 复合唯一；`number` 是 Space 内递增的 `#N`，在创建事务内取 Issue 与 Team Worktree 编号的最大值再加 1（二者共用序列）|
+| `title`, `body` | 标题（1–256 字符）与 Markdown 正文（≤ 65 536 字符） |
+| `state`, `state_reason` | `open` 时原因为空；`closed` 时为 `completed | not_planned`，由表级 CHECK 保证 |
+| `author_user_id`, `closed_by_user_id`, `closed_at` | 作者与关闭信息 |
+| `created_at`, `updated_at` | 评论、事件和关系变更都会刷新 `updated_at` |
+
+V1 不允许删除 Issue，所以编号不会复用。以后加入删除，需要改用独立计数表。
+
+### `issue_comments` 与 `issue_events`
+
+评论保存作者、正文和时间；作者可编辑，作者、Owner、Admin 可硬删除。事件保存 `kind`
+（`closed | reopened | renamed | labeled | unlabeled | assigned | unassigned | node_referenced | node_unreferenced`）
+和 `payload_json` 快照（标签名与颜色键、用户名、Node 名称），标签被删除或文件被改名后历史仍可读。
+时间线按 `(created_at, 评论优先, id)` 合并两张表，用 keyset 分页。
+
+### `issue_labels` 与 `issue_label_links`
+
+标签属于 Space，名称在 Space 内大小写不敏感唯一。`color` 保存调色板键（`gray | blue | green | yellow | orange | red | purple | pink`），
+只在服务层校验，调整调色板不需要迁移。每个 Space 最多 100 个标签，每个 Issue 最多 20 个。删除标签会级联移除关联。
+
+### `issue_assignees` 与 `issue_node_refs`
+
+Assignee 指派时必须是 Space Owner 或成员，最多 10 人；成员离开 Space 后已有指派保留。
+引用 Node 指派时必须在同一 Space 且不在回收站，最多 20 个；Node 被永久删除时引用级联删除，
+Node 在回收站时读取侧显示为不可用且不返回名称。
+
+## Operations
+
+`operations` 是跨产品数据库与 Collaboration 服务操作的幂等日志。支持：
+
+```text
+create_resource
+create_blob_resource
+replace_blob_content
+create_worktree
+add_worktree_unit
+create_worktree_unit
+merge_worktree
+discard_worktree
+activate_worktree_resource
+```
+
+状态为 `pending | completed | failed`。`payload_json` 在首次请求时固化服务器生成的稳定
+Node/Resource/Unit ID；相同 Idempotency Key 只能重放相同意图。Lease、Attempt、
+`next_attempt_at` 和最后错误字段支持后台恢复。
+
+V3 Operation JSON 只使用明确的 Node/Resource/Unit 或 Blob 上传身份，不读取旧
+`entryId`、`fileId` 或 `fileEntryId`。
+
+## 创建与修改事务
+
+### 创建纯组织 Node
+
+`POST /api/nodes` 校验目标 Space/Parent 的 Create Children Capability 后，只写一条
+Node。
+
+### 创建 Univer Resource
+
+`POST /api/resources`：
+
+1. 按 Idempotency Key 预留 Node ID、Resource ID 和 Unit ID；
+2. 创建 Collaboration Unit；
+3. 在一个产品事务中写 Node、Resource、Univer Resource并完成 Operation；
+4. 失败时按错误是否可重试保留 Pending 或 Failed 状态。
+
+### 创建 Blob Resource
+
+1. `POST /api/blob-upload-sessions` 按 Idempotency Key 预留 Session、Node、Resource 和 Object ID；
+2. `PUT .../content` 流式写入 BlobStore，同时校验长度、计算 Hash 并检测 MIME；
+3. `POST .../complete` 校验对象后，在单个 SQLite 事务中发布 Node/Resource；
+4. `content` 与 `download` 都重新解析 Node 权限并支持单段 Byte Range。
+
+### 替换 Blob 内容
+
+`PUT /api/blob-resources/{resourceId}/content` 保留 Resource、Node、原始文件名、目录与 ACL。
+必需 `If-Match`（单个带引号强 ETag）、`Content-Length` 和 `Idempotency-Key`。
+先持久化 `replace_blob_content` Operation（目标、预期 ETag、长度、新 Object Key），再写新对象。
+上传结束后重新校验编辑权限，并在产品事务中比较旧 ETag、切换对象与内容元数据、生成随机新 ETag、
+完成 Operation，同时写入 `blob_content_replaced` 删除任务。内容相同也生成新 ETag；SHA-256
+仍表示字节校验值。版本不匹配返回 412，旧对象与旧内容保留。
+失败请求标记 Failed，并写 `blob_upload_abandoned` 删除任务；启动阶段将中断的 Pending 替换
+按同样方式收敛。Completed Key 只回放记录结果，不重复写入；Pending 不可并发重入，Failed
+必须用新 Key 重试。Operation 查询用于确认未知结果。Blob 不进入 Worktree，也不保存历史版本。
+
+### 创建与读取 Univer Asset
+
+1. `CollaborationImageIoService` 向 Trunk 或 Worktree File API 提交 `source=3`、`assign=unitID`
+   和 Multipart `file`；
+2. 服务端重新验证 Unit 的编辑权限，流式写入注入的 `BlobStore`，并以服务端字节检测结果为准；
+3. Snapshot 只写返回的 `FileId`；
+4. 读取先由 `sign-url` 返回同域 `/content` 地址；每次 Content 请求重新验证当前 Unit/Worktree
+   权限，使用 `private, no-store` 并支持单段 Byte Range；
+5. Worktree Merge 只把成功合入或未变化 Unit 的 Asset 发布到 Trunk。
+
+### Rename 与 Move
+
+Rename 只更新 `nodes.name`。Move 只更新 `nodes.parent_id`；目标必须同 Space、有创建
+权限且不在 Source 的后代链中。Resource 和 Unit ID 均保持不变。
+
+## 一次性自动迁移边界
+
+临时迁移入口位于 `server/src/db/migrations/`，V0 读取器隔离在 `legacy-v0/`，业务模块不导入
+它们。应用打开磁盘数据库时：
+
+1. 不存在或空文件：创建 V12，不备份；
+2. 完整 V12：校验指纹后正常启动，不重复备份；
+3. 完整 V11/V10/V9/V8/V7/V6/V5：先生成一致性备份，再迁移到 V12；V6 保留已有公开读取策略，V5 的旧 Space 默认关闭公开读取；
+4. 完整 V4/V3/V2/V1：备份后逐版本迁移到 V12；
+5. 完整 V0：先生成一致性备份，再直接迁移到 V12；
+6. 未知版本、部分 Schema、完整性错误或不一致业务状态：拒绝启动。
+
+迁移器还识别合并前 Discord 开发分支产生的 V4 变体：若 Asset Upload 仍含
+`detected_media_type`，先执行正式 V3 → V4 Asset 迁移，再执行 V4 → V5 Identity 迁移。
+该兼容路径同样会先创建并验证 V4 一致性备份。
+
+每个版本迁移步骤都在独立的 `BEGIN IMMEDIATE` 事务中完成，保留原 Node、Unit、User、Space、Trash Batch、
+Worktree 和 Operation ID，为现有内容生成新的 Resource ID，并类型化重写所有已完成
+Operation JSON。V0 迁移前要求没有 Pending/Failed Operation；后续版本保留未完成恢复状态。
+
+提交前后校验：
+
+- 表数量映射；
+- Resource/Univer 扩展一一对应；
+- 权限、Recent、Trash 与 Worktree 映射；
+- Node 父链无环；
+- `foreign_key_check` 无记录；
+- `integrity_check = ok`；
+- V2 删除任务完整映射到通用 Outbox；
+- V3 Asset Upload 的内容检测字段被无损移除；声明 MIME 缺失时用旧检测值回填；
+- V4 External Identity 被无损扩展为支持 Discord Provider；
+- 旧表全部删除且 `user_version = 12`。
+
+失败步骤会回滚且应用不启动；V1/V2 链式升级可能已提交有效的中间版本，但启动前生成的
+一致性备份始终保留，下一次启动可继续升级或由运维恢复。错误中会给出备份路径。
+迁移实现是唯一兼容边界；线上数据库全部完成升级后，可以删除 `migrations/`、
+`legacy-v0/` 及初始化函数中的一次调用，不影响 V12 Schema 或业务代码。
+
+V6 → V7 只重建 Operation 和删除任务表以扩展 CHECK 枚举，完整保留所有行和恢复字段；
+Blob 及上传会话表不变。升级前自动创建一致性备份；停旧实例后由单个新实例完成迁移。
+
+## Unit 内容编辑保护（V8）
+
+`content_permission_objects` 保存随机权限 ID、所属 Unit、SDK 对象类型、创建者、名称、
+动作策略、查看范围和编辑范围；`content_permission_collaborators` 保存显式协作者与角色。
+它们属于产品授权数据，不保存范围坐标、文档内容、snapshot、changeset 或 revision。
+保护目标与权限 ID 的绑定仍由 SDK mutation 和协同存储管理。
+
+先提交产品 ACL，再提交协同绑定；两者没有跨库事务。未绑定和解绑后的 ACL 保留，允许重试、
+撤销与历史引用；不在普通请求中清理。永久删除 Resource 时按 Unit 外键级联删除。
+回收站、移动、重命名不改变权限 ID。创建者必须是已存在 User；失去文件编辑权限后也失去管理权。
+Owner/Admin 以当前产品角色接管管理，`cfgEnableObjInherit` 为 true。`read_scope` 与 `edit_scope`
+分别保存协议里的查看和编辑范围。编辑范围为 `OneSelf` 时，非 Owner 只在查看范围为所有协作者时保留 View。
+查看范围不是所有协作者时，能打开文件的人不再因此获得 View；显式协作者仍按角色判断。
+复制、打印、导出服从对象 strategies，缺省时 Copy 为 Reader、Print 和 Export 为 Editor。
+Snapshot、history 和 export 接口不按对象范围过滤，不构成内容保密。
+
+V7 → V8 在单个事务内新增两表及索引，不删除或改写旧字段、业务行、Blob 身份或恢复状态。
+启动前备份，校验 V7/V8 指纹、外键及完整性；失败回滚至 V7。已有未完成 Operation 可以保留。
+回滚应用版本须停新实例并恢复迁移前备份，不可让旧进程继续写 V8 文件。
+
+V8 → V9 在单个事务内新增 Issue 相关的七张表及索引，不删除或改写旧字段、业务行、Blob 身份或恢复状态。
+启动前备份，校验 V8/V9 指纹、外键及完整性；失败回滚至 V8。已有未完成 Operation 可以保留。
+回滚应用版本须停新实例并恢复迁移前备份，不可让旧进程继续写 V9 文件。
+
+V9 → V10 在单个事务内仅新增 `space_stars`，不改写已有业务表和行；已有收藏初始为空。
+准备阶段在业务 Repository 初始化前校验 V9 指纹、生成并验证一致性备份；事务提交前检查外键与完整性，
+然后校验 V10 指纹。失败事务回滚至 V9，备份保留且启动失败。重复启动不重复迁移或备份。
+部署须先停全部旧实例，由单个 V10 实例完成迁移和健康检查后恢复服务；回退须停新实例并恢复 V9 备份。
+
+V10 → V11 在单个事务内仅为 `spaces` 增加 `description TEXT NOT NULL DEFAULT ''`，已有 Space 取空字符串，
+不改写其他列、表或行。准备阶段在业务 Repository 初始化前校验 V10 指纹、生成并验证一致性备份；
+事务提交前检查外键与完整性，然后校验 V11 指纹（`spaces` 列顺序为 `…public_read, description`）。
+旧版本链路沿用各自的 `spaces` 列集合校验，因此 V1–V9 升级后同样落到 V11。失败事务回滚至 V10，备份保留且启动失败。
+重复启动不重复迁移或备份。部署须先停全部旧实例，由单个 V11 实例完成迁移和健康检查后恢复服务；
+回退须停新实例并恢复 V10 备份。
+
+V11 → V12 在单个事务内仅新增 `spaces.slug`（`TEXT COLLATE NOCASE`）、`worktrees.number`、三个部分唯一索引
+（`spaces_owner_slug`、`worktrees_team_number`、`worktrees_user_number`）和两个 slug Trigger，不改写任何已有行：
+旧 Team Space 的 `slug` 与旧 Worktree 的 `number` 均为 `NULL`。准备阶段在业务 Repository 初始化前校验 V11 指纹、
+生成并验证一致性备份；事务提交前检查外键与完整性，然后校验 V12 指纹。V1–V10 的升级链与 V0 迁移都落到 V12。
+失败事务回滚至 V11，备份保留且启动失败。重复启动不重复迁移或备份。部署须先停全部旧实例，由单个 V12 实例完成迁移
+和健康检查后恢复服务；回退须停新实例并恢复 V11 备份。

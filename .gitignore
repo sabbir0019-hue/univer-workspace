@@ -1,0 +1,14 @@
+node_modules/
+dist/
+lib/
+package-dist/
+.release/
+coverage/
+.data/
+.DS_Store
+.vscode/
+*.tsbuildinfo
+.agents/
+.claude/
+skills-lock.json
+.gstack/

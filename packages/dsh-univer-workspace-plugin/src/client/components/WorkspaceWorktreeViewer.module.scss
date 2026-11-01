@@ -1,0 +1,91 @@
+/* Middle full-height Worktree Changes review surface: header + collapsible
+ * smart path tree + default-expanded Unit accordion stream. */
+
+.changes {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+}
+
+.changesHeader {
+  display: flex;
+  box-sizing: border-box;
+  // This is a secondary toolbar below the Worktree title, not a pane header.
+  min-height: 44px;
+  flex: none;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 20px;
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-background);
+}
+
+.changesTitle {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.changesBody {
+  position: relative;
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  grid-template-columns: minmax(220px, 240px) minmax(0, 1fr);
+  background: var(--uvf-color-surface, #fff);
+}
+
+.changesBody[data-tree-collapsed] {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.accordionScroll {
+  position: relative;
+  z-index: 0;
+  isolation: isolate;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow-y: auto;
+  background: color-mix(in srgb, var(--uvf-color-border, #dfe3eb) 8%, var(--uvf-color-surface, #fff));
+}
+
+.treePane {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+
+  > nav { flex: 1; }
+}
+.treePane[hidden] { display: none; }
+.treeOverlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  overflow: hidden;
+}
+
+.treeBackdrop {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background: rgb(0 0 0 / 18%);
+}
+
+.treeDrawer {
+  position: absolute;
+  inset: 0 auto 0 0;
+  display: flex;
+  width: min(280px, 85%);
+  background: var(--color-background);
+  box-shadow: 4px 0 12px rgb(0 0 0 / 12%);
+  > nav { flex: 1; min-width: 0; min-height: 0; }
+}

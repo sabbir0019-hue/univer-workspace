@@ -1,0 +1,131 @@
+/api/recent-resources:
+  get:
+    tags: [Views]
+    operationId: listRecentResources
+    summary: List currently accessible Resources by last successful open.
+    parameters:
+      - $ref: ../schemas/common.yaml#/CursorParameter
+      - $ref: ../schemas/common.yaml#/LimitParameter
+    responses:
+      "200":
+        description: Recent Resources.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/views.yaml#/RecentResourceList
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+
+/api/owned-by-me:
+  get:
+    tags: [Views]
+    operationId: listOwnedByMe
+    summary: List Resources in Spaces owned by the current User.
+    parameters:
+      - $ref: ../schemas/common.yaml#/CursorParameter
+      - $ref: ../schemas/common.yaml#/LimitParameter
+    responses:
+      "200":
+        description: Resources owned by the current User.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/views.yaml#/OwnedResourceList
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+
+/api/html-views:
+  get:
+    tags: [Views]
+    operationId: listHtmlViews
+    summary: List .univer.html Blobs the current user can open, newest node update first.
+    parameters:
+      - $ref: ../schemas/common.yaml#/CursorParameter
+      - $ref: ../schemas/common.yaml#/LimitParameter
+      - name: spaceId
+        in: query
+        required: false
+        description: Restrict results to one accessible Space.
+        schema:
+          type: string
+          minLength: 1
+    responses:
+      "200":
+        description: HTML view Blobs visible to the current user.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/views.yaml#/OwnedResourceList
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+
+/api/shared-with-me:
+  get:
+    tags: [Views]
+    operationId: listSharedWithMe
+    summary: List direct Node Grants in other Personal Spaces.
+    parameters:
+      - $ref: ../schemas/common.yaml#/CursorParameter
+      - $ref: ../schemas/common.yaml#/LimitParameter
+    responses:
+      "200":
+        description: Directly shared Nodes.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/views.yaml#/SharedList
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+
+/apps/{nodeId}/run:
+  get:
+    tags: [Views]
+    operationId: runStandaloneHtmlApp
+    summary: Open an authorized HTML App as a sandboxed top-level document, without an iframe.
+    description: |
+      Resolves the existing Node and Blob ACL on every request. Anonymous readers may
+      open link-shared Apps. Other anonymous requests receive a trusted login handoff
+      that preserves the full pathname, query and fragment. Signed-in unauthorized
+      readers receive 404. Only ready .univer.html Blobs up to 5 MiB are supported.
+      Declarative Sheet bindings require the embedded Workspace viewer; standalone
+      Apps have no Binding Host, cookies, storage or Workspace API access. Query and
+      fragment belong to the App and are not interpreted by Workspace.
+    security:
+      - sessionCookie: []
+      - {}
+    parameters:
+      - name: nodeId
+        in: path
+        required: true
+        schema:
+          type: string
+          minLength: 1
+    responses:
+      "200":
+        description: Sandboxed HTML App or trusted login handoff.
+        headers:
+          Content-Security-Policy:
+            description: App sandbox excludes allow-same-origin; login handoff allows only its hashed script.
+            schema:
+              type: string
+          Cache-Control:
+            schema:
+              type: string
+              const: private, no-store
+        content:
+          text/html:
+            schema:
+              type: string
+      "400":
+        description: Invalid bindings return JSON; live Sheet bindings return HTML with the embedded Node entry.
+        content:
+          text/html:
+            schema:
+              type: string
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ErrorResponse
+      "404":
+        $ref: ../schemas/common.yaml#/NotFound
+      "413":
+        $ref: ../schemas/common.yaml#/PayloadTooLarge

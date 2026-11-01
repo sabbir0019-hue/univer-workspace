@@ -1,0 +1,298 @@
+/api/blob-upload-sessions:
+  post:
+    tags: [Blobs]
+    operationId: createBlobUploadSession
+    summary: Reserve stable identities and create a Blob Upload Session.
+    parameters:
+      - $ref: ../schemas/common.yaml#/IdempotencyKeyParameter
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: ../schemas/blobs.yaml#/CreateBlobUpload
+    responses:
+      "201":
+        description: A new Upload Session was reserved.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/blobs.yaml#/BlobUploadSessionEnvelope
+      "200":
+        description: The existing Upload Session for this Idempotency Key.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/blobs.yaml#/BlobUploadSessionEnvelope
+      "400":
+        $ref: ../schemas/common.yaml#/BadRequest
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+      "403":
+        $ref: ../schemas/common.yaml#/Forbidden
+      "404":
+        $ref: ../schemas/common.yaml#/NotFound
+      "409":
+        $ref: ../schemas/common.yaml#/Conflict
+      "413":
+        $ref: ../schemas/common.yaml#/PayloadTooLarge
+
+/api/blob-upload-sessions/{uploadId}:
+  parameters:
+    - name: uploadId
+      in: path
+      required: true
+      schema:
+        type: string
+  get:
+    tags: [Blobs]
+    operationId: getBlobUploadSession
+    summary: Get current Upload Session state.
+    responses:
+      "200":
+        description: Current Upload Session.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/blobs.yaml#/BlobUploadSessionEnvelope
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+      "404":
+        $ref: ../schemas/common.yaml#/NotFound
+  delete:
+    tags: [Blobs]
+    operationId: abortBlobUploadSession
+    summary: Abort an unpublished Blob Upload Session.
+    responses:
+      "204":
+        description: Upload Session aborted.
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+      "404":
+        $ref: ../schemas/common.yaml#/NotFound
+      "409":
+        $ref: ../schemas/common.yaml#/Conflict
+
+/api/blob-upload-sessions/{uploadId}/content:
+  parameters:
+    - name: uploadId
+      in: path
+      required: true
+      schema:
+        type: string
+  put:
+    tags: [Blobs]
+    operationId: uploadBlobContent
+    summary: Stream the exact reserved Blob bytes into storage.
+    requestBody:
+      required: true
+      content:
+        application/octet-stream:
+          schema:
+            type: string
+            format: binary
+    responses:
+      "204":
+        description: Bytes received and verified.
+      "400":
+        $ref: ../schemas/common.yaml#/BadRequest
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+      "404":
+        $ref: ../schemas/common.yaml#/NotFound
+      "409":
+        $ref: ../schemas/common.yaml#/Conflict
+
+/api/blob-upload-sessions/{uploadId}/complete:
+  parameters:
+    - name: uploadId
+      in: path
+      required: true
+      schema:
+        type: string
+  post:
+    tags: [Blobs]
+    operationId: completeBlobUploadSession
+    summary: Atomically publish the Node and Blob Resource.
+    responses:
+      "201":
+        description: Blob Resource published.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/resources.yaml#/ResourceCreateResponse
+      "200":
+        description: Existing result for an already completed Upload Session.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/resources.yaml#/ResourceCreateResponse
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+      "403":
+        $ref: ../schemas/common.yaml#/Forbidden
+      "404":
+        $ref: ../schemas/common.yaml#/NotFound
+      "409":
+        $ref: ../schemas/common.yaml#/Conflict
+
+/api/blob-resources/{resourceId}/content:
+  $ref: "#/BlobContentPath"
+
+/api/blob-resources/{resourceId}/download:
+  $ref: "#/BlobDownloadPath"
+
+BlobContentPath:
+  parameters:
+    - $ref: "#/BlobResourceId"
+  get:
+    parameters:
+      - $ref: "#/Range"
+      - $ref: "#/IfNoneMatch"
+    security:
+      - {}
+      - sessionCookie: []
+    description: Anonymous readers receive viewer access through Link Sharing or Space public read; inaccessible content returns 404.
+    tags: [Blobs]
+    operationId: getBlobContent
+    summary: Read Blob bytes for client-selected preview or other use.
+    responses:
+      "200":
+        $ref: "#/BlobBytes"
+      "206":
+        $ref: "#/BlobBytes"
+      "304":
+        description: The current ETag matches If-None-Match.
+      "404":
+        $ref: ../schemas/common.yaml#/NotFound
+      "416":
+        $ref: ../schemas/common.yaml#/RangeNotSatisfiable
+
+  put:
+    tags: [Blobs]
+    operationId: replaceBlobContent
+    summary: Replace all Blob bytes while preserving Resource identity.
+    description: |
+      Publishes immediately without Worktree review. Requires editor access, Content-Length,
+      one quoted strong If-Match ETag from the downloaded bytes, and a stable Idempotency-Key.
+      Preserves the Node, name, original filename, location, ACL and Resource ID.
+      A successful replacement generates a fresh ETag even for identical bytes.
+      Replaying a completed key returns its recorded result without writing again.
+      Inspect GET /api/operations/{id} after an uncertain response. Pending requests cannot
+      be started twice; a failed or interrupted replacement requires a new key.
+    parameters:
+      - $ref: ../schemas/common.yaml#/IdempotencyKeyParameter
+      - name: If-Match
+        in: header
+        required: true
+        schema:
+          type: string
+        description: Exactly one quoted strong ETag; wildcard and weak validators are not accepted.
+      - name: Content-Length
+        in: header
+        required: true
+        schema:
+          type: integer
+          minimum: 0
+    requestBody:
+      required: true
+      content:
+        application/octet-stream:
+          schema:
+            type: string
+            format: binary
+    responses:
+      "200":
+        description: Content replaced, or the recorded result of this completed request.
+        headers:
+          ETag:
+            schema:
+              type: string
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/blobs.yaml#/BlobReplacementResult
+      "400":
+        $ref: ../schemas/common.yaml#/BadRequest
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+      "403":
+        $ref: ../schemas/common.yaml#/Forbidden
+      "404":
+        $ref: ../schemas/common.yaml#/NotFound
+      "409":
+        $ref: ../schemas/common.yaml#/Conflict
+      "412":
+        description: Content changed since the supplied ETag. Download and reconcile before retrying.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ErrorResponse
+      "413":
+        $ref: ../schemas/common.yaml#/PayloadTooLarge
+
+BlobDownloadPath:
+  parameters:
+    - $ref: "#/BlobResourceId"
+    - $ref: "#/Range"
+    - $ref: "#/IfNoneMatch"
+  get:
+    security:
+      - {}
+      - sessionCookie: []
+    description: Anonymous readers receive viewer access through Link Sharing or Space public read; inaccessible content returns 404.
+    tags: [Blobs]
+    operationId: downloadBlobContent
+    summary: Download Blob bytes as an attachment.
+    responses:
+      "200":
+        $ref: "#/BlobBytes"
+      "206":
+        $ref: "#/BlobBytes"
+      "304":
+        description: The current ETag matches If-None-Match.
+      "404":
+        $ref: ../schemas/common.yaml#/NotFound
+      "416":
+        $ref: ../schemas/common.yaml#/RangeNotSatisfiable
+
+BlobResourceId:
+  name: resourceId
+  in: path
+  required: true
+  schema:
+    type: string
+
+Range:
+  name: Range
+  in: header
+  required: false
+  schema:
+    type: string
+  description: A single RFC 9110 bytes range.
+
+IfNoneMatch:
+  name: If-None-Match
+  in: header
+  required: false
+  schema:
+    type: string
+  description: Return 304 when the current content ETag matches.
+
+BlobBytes:
+  description: Blob bytes with media type, ETag, disposition, and Range headers.
+  headers:
+    Accept-Ranges:
+      schema:
+        type: string
+    Content-Range:
+      schema:
+        type: string
+    ETag:
+      schema:
+        type: string
+  content:
+    "*/*":
+      schema:
+        type: string
+        format: binary

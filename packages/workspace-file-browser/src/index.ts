@@ -1,0 +1,35 @@
+export { WorkspaceFileBrowser } from "./WorkspaceFileBrowser.js";
+export { getWorkspaceBlobIcon } from "./NodeIcon.js";
+export {
+  canDropWorkspaceFileNode,
+  dragItemOf,
+  groupWorkspaceFileSpaces,
+  workspaceFileDropKey,
+  type WorkspaceFileDragItem,
+  type WorkspaceFileDropDestination,
+  type WorkspaceFileSpaceGroups,
+} from "./model.js";
+export type {
+  WorkspaceFileAccessRole,
+  WorkspaceDocumentMode,
+  WorkspaceFileBrowserDataSource,
+  WorkspaceFileBrowserProps,
+  WorkspaceFileChildrenRequest,
+  WorkspaceFileCreateKind,
+  WorkspaceFileCreateRequest,
+  WorkspaceFileGrant,
+  WorkspaceFileLinkSharing,
+  WorkspaceFileLocale,
+  WorkspaceFileMoveRequest,
+  WorkspaceFileNode,
+  WorkspaceFileNodeCapabilities,
+  WorkspaceFileResource,
+  WorkspaceFileShareRole,
+  WorkspaceFileSharingDataSource,
+  WorkspaceFileSpace,
+  WorkspaceFileSpaceCapabilities,
+  WorkspaceFileTreeControls,
+  WorkspaceFileUploadRequest,
+  WorkspaceFileUser,
+  WorkspaceUnitType,
+} from "./types.js";

@@ -1,0 +1,211 @@
+# Univer Workspace HTTP Interface Concepts
+
+The OpenAPI description in this directory is the source of truth for paths,
+parameters, JSON schemas, status codes, and stable error codes. This document
+explains behavior that spans multiple operations.
+
+## Conventions
+
+- JSON fields use `camelCase`; timestamps are UTC ISO 8601 strings.
+- IDs and cursors are opaque strings.
+- Authentication uses an opaque `HttpOnly` cookie. React never reads a session
+  secret or stores a bearer token.
+- Unsafe requests accept JSON and require a same-origin `Origin`.
+- Unauthorized discovery of a Space, Node, Resource, or Worktree returns
+  `404 NOT_FOUND`; an absent login session returns `401 UNAUTHENTICATED` on
+  operations requiring authentication.
+- Error branching uses `error.code`, never the diagnostic `message`.
+
+## Authentication
+
+Password Credentials and External Identities are optional authentication
+methods for the same User. GitHub and Discord login map the provider's stable user ID to an
+internal User. It never identifies or automatically links a User by email.
+
+External login and explicit linking use different OAuth intents. Both validate
+`state` and PKCE from a short-lived protected cookie. An access token used
+only to resolve identity is discarded after the callback.
+
+CLI browser login uses a separate device authorization flow. The unauthenticated
+CLI creates a ten-minute request containing a high-entropy device code and a
+human-verifiable code. A signed-in browser explicitly approves the matching
+code; the CLI then exchanges the device code exactly once for its own normal
+login session. Pending requests are bounded, process-local, and non-durable.
+They contain no browser cookie, password, or external OAuth access token.
+
+`GET /api/session` returns `200` for both authenticated and anonymous clients so
+React can use it as its application bootstrap request.
+
+## Capabilities
+
+The server resolves effective Roles and Capabilities from Space ownership, Team
+Membership, ancestor Node Grants, Trash state, Worktree state, and current
+Collaboration state. React consumes Capabilities and never rebuilds the role
+matrix.
+
+Direct Share applies only to Personal Space Nodes. A Node Grant applies to the
+Node and its current and future descendants, regardless of whether any Node has
+a Resource. Team Spaces use Membership and do not create Node Grants.
+
+Link Sharing also applies only to Personal Space Nodes. It changes the access
+policy of the Node's canonical URL rather than creating a separate bearer link.
+It admits anonymous viewers, does not create a Direct Grant, and is inherited
+by current and future descendants. The configured role applies to signed-in users;
+anonymous readers remain viewers even for an editor link. Link Sharing Editor access permits
+content editing but not Node structure
+changes, Trash, or further sharing.
+
+Space public read also admits anonymous viewers, including in Team Spaces. It
+permits browsing that Space by ID, but never anonymous enumeration of `/api/spaces`.
+Anonymous clients can read Node metadata, resolve Resources by Unit ID, browse accessible children,
+open Resources, and read Blob and Trunk Asset bytes. All writes and administration,
+Recent, global discovery, and Worktrees continue to require a login session.
+Both policies use existing settings: already-enabled sharing/public read becomes
+anonymous-readable on upgrade. No additional switch or database migration is needed.
+HTML and referenced Units retain independent source permission checks.
+
+## Node discovery
+
+Node breadcrumbs contain only the path the current User may discover.
+Entering through a Direct Share starts the breadcrumb at the highest visible
+shared root and does not expose its Personal Space ancestors.
+
+Node listing, Recent, and Shared With Me never grant access. Every read
+re-runs the same Access Resolver.
+
+## Idempotency and operations
+
+Requests spanning the product database and Collaboration Service require
+`Idempotency-Key`.
+
+- The key is globally unique and bound to its original User and normalized request.
+- Repeating the same key and body returns the same Operation.
+- Reusing the key with a different body returns
+  `409 CONFLICT`.
+- A client retry after a timeout reuses the original key.
+
+For Collaboration operations, the server attempts an Operation immediately. It returns the completed resource
+when the initial attempt finishes in time, or `202` with a Location header when
+the Operation remains pending. Background recovery is independent of the HTTP
+request.
+
+## Resource creation and opening
+
+A Univer Resource does not exist while `createResource` is pending. The Operation first
+creates the Collaboration Unit and only then creates the product Node, Resource,
+and Univer Resource extension in one transaction.
+
+Blob creation reserves stable identities in an Upload Session, streams and verifies
+the bytes, and publishes its Node/Resource only on Complete. Opening a Resource is
+a discriminated union: Univer returns Unit/editor metadata, while Blob returns
+server-detected MIME plus content and download URLs. React chooses the preview
+component from MIME; the server does not return a preview kind.
+
+The Collaboration Snapshot endpoint independently resolves the reader and
+resolves current Resource Access. Blob content/download endpoints do the same via
+the owning Node and support one byte range. Recent is updated only by a successful
+authenticated Resource Open; anonymous reads, previews and Worktree scopes never update Recent.
+
+Blob replacement uses `PUT /api/blob-resources/{resourceId}/content`, a stable
+Idempotency-Key, and one quoted strong If-Match ETag from the downloaded content.
+It publishes immediately, preserves identity and filename, and generates a fresh
+ETag even for identical bytes. HTTP 412 means the caller must download and
+reconcile current content. The Operation records completion for lost-response
+recovery; interrupted replacements fail and their unpublished bytes are queued
+for deletion. There is no Blob Worktree or version-history surface.
+
+## Trash batches
+
+One recursive trash action creates one Trash Batch. Nodes already in Trash
+retain their earlier Batch.
+
+Restoration preserves the original location. If a Batch root has an ancestor in
+another active Batch, restoration returns `RESTORE_PARENT_IN_TRASH`; the server
+does not restore extra content or move the Node to the Space root.
+
+Permanent removal is blocked when the subtree contains another active Batch or
+a Resource referenced by an active Worktree. Product removal is irreversible.
+Physical Blob deletion is queued transactionally and retried by a background
+outbox worker. Collaboration Unit cleanup follows a separate retention policy.
+
+## Worktrees
+
+Collaboration Worktree Service owns the lifecycle state:
+
+```text
+draft → ready → merging → merged
+  ↑       │         └── conflict/failure → ready
+  └──── reopen
+
+draft/ready → discarded
+```
+
+Merge results are stored per Unit. Successful Units do not roll back if another
+Unit conflicts. A successfully merged Worktree-local Unit becomes a Resource
+Node only after its Activation Operation completes.
+
+User Worktrees are creator-private and may contain editable Resources from different
+Spaces. Team Worktrees belong to one Team Space. Their Visibility controls who
+may Review; Visibility never grants Resource Access.
+
+The Creator can discover and Review a private Team Worktree. The Team Space
+Owner and Admin can discover its Summary and perform administrative Reopen or
+Discard actions, but cannot read its Unit list or draft content. Other Members
+cannot discover it. A space-visible Team Worktree can be discovered and reviewed
+read-only by current Space Members.
+
+## Repository names and numbers
+
+A Team Space may carry a `slug`, unique per owner and compared case-insensitively. Together with the owner's
+username it forms the full name `<owner>/<slug>` (`SpaceView.fullName`), resolved by `GET /api/spaces/lookup`.
+Every Personal Space, including those that predate slugs, is `<owner>/personal`; `personal` cannot be used as a Team
+Space slug. Team Spaces created before slugs existed have `slug: null` until an administrator sets one. Renaming a
+username or slug invalidates the old full name; there is no redirect.
+
+A Team Worktree shares its Space's number sequence with Issues, so `#12` names one object per Space
+(`GET /api/spaces/{spaceId}/worktrees/{number}`). A User Worktree is numbered per creator and addressed through
+the creator's own Personal Space. Worktrees created before numbering existed keep `number: null` and are addressed
+by ID.
+
+## Issues
+
+Issues exist only in Team Spaces. A Personal Space returns `409 CONFLICT`; a Space the caller
+cannot discover returns `404`. Every endpoint requires a login Session.
+
+An Issue is addressed by its Space-scoped number (`#12`) in the path and by an opaque ID
+elsewhere (comments, labels). Numbers increase inside a Space and are never reused.
+
+| Action | owner | admin | editor | viewer member | public-read non-member |
+|---|---|---|---|---|---|
+| Read Issues, comments, labels | yes | yes | yes | yes | yes |
+| Open an Issue, comment | yes | yes | yes | yes | no |
+| Edit or close one's own Issue | yes | yes | yes | yes | no |
+| Edit, close, label, assign or reference files on any Issue | yes | yes | yes | no | no |
+| Create, change, delete labels | yes | yes | no | no | no |
+| Edit a comment | author | author | author | author | no |
+| Delete a comment | yes | yes | author | author | no |
+
+`SpaceView.capabilities.createIssue`, `triageIssues` and `manageIssueLabels` and
+`Issue.capabilities` report what the caller may do. Clients never infer rights from a role.
+
+`PATCH` replaces `labelIds`, `assigneeUserIds` and `nodeIds` as whole sets. Existing
+assignees who left the Space and references that became unavailable may stay in a
+submitted set; only newly added entries are validated. Concurrent edits are
+last-writer-wins. Issue writes touch only the product database, so they carry no
+`Idempotency-Key`; after an unknown result, list the Space or read the timeline before
+retrying a create or comment.
+
+The timeline merges comments and events in chronological order. Event payloads are
+snapshots (label name and color, user names, file names), so they stay readable after a
+label is deleted or a file is renamed.
+
+## Collaboration protocol
+
+The product OpenAPI description does not redefine Univer Collaboration
+Snapshot, Changeset, Session Ticket, or WebSocket protocol schemas. Those
+endpoints are owned by the Univer Collaboration packages.
+
+Every protocol request authenticates the same Login Session and crosses the
+Collaboration Access Resolver described in
+[application-design.md](../../docs/application-design.md). Client-supplied Unit IDs,
+Roles, or editor modes are never trusted.

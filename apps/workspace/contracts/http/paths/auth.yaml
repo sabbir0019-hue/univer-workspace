@@ -1,0 +1,570 @@
+/api/session:
+  get:
+    tags: [Session]
+    operationId: getSession
+    summary: Get the current login session.
+    security:
+      - {}
+      - sessionCookie: []
+    responses:
+      "200":
+        description: Current authenticated or anonymous session.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/identity.yaml#/SessionView
+
+/api/auth/authorize:
+  get:
+    tags: [Authentication]
+    operationId: oauthAuthorize
+    summary: Start an OAuth-style authorization for a registered client.
+    security:
+      - {}
+      - sessionCookie: []
+
+    parameters:
+      - name: client_id
+        in: query
+        required: true
+        schema:
+          type: string
+      - name: redirect_uri
+        in: query
+        required: true
+        schema:
+          type: string
+      - name: state
+        in: query
+        required: true
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9_-]{32,256}$
+      - name: code_challenge
+        in: query
+        required: true
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9_-]{43,128}$
+      - name: scope
+        in: query
+        required: false
+        schema:
+          type: string
+    responses:
+      "302":
+        description: Redirect to Workspace login or back to the registered redirect_uri with a one-time code.
+        headers:
+          Location:
+            required: true
+            schema:
+              type: string
+      "400":
+        $ref: ../schemas/common.yaml#/BadRequest
+
+/api/auth/token:
+  post:
+    tags: [Authentication]
+    operationId: oauthToken
+    summary: Exchange a one-time authorization code for a registered client identity.
+    description: |
+      When the granted scope includes `session`, the response also carries a
+      Workspace login session token in `access_token`; the client presents
+      it as the `workspace_session` cookie on product and collaboration
+      endpoints, acting with the authorizing User's permissions until it
+      expires. Identity-only grants return an empty `access_token`.
+    security: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [grant_type, code, client_id, redirect_uri, code_verifier]
+            properties:
+              grant_type:
+                type: string
+                enum: [authorization_code]
+              code:
+                type: string
+              client_id:
+                type: string
+              client_secret:
+                type: string
+                description: Required for confidential clients; omitted for public PKCE clients.
+              redirect_uri:
+                type: string
+              code_verifier:
+                type: string
+    responses:
+      "200":
+        description: The registered client identity and, for `session` grants, a login session token.
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                access_token:
+                  type: string
+                  description: |
+                    Workspace session token for `session` grants, empty
+                    string for identity-only grants.
+                token_type:
+                  type: string
+                expires_in:
+                  type: integer
+                  description: |
+                    Seconds until the issued session expires for `session`
+                    grants.
+                user:
+                  $ref: ../schemas/identity.yaml#/User
+      "400":
+        $ref: ../schemas/common.yaml#/BadRequest
+      "401":
+        description: Invalid client secret or PKCE verifier.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ErrorResponse
+
+/api/auth/logout:
+  post:
+    tags: [Session]
+    operationId: logout
+    summary: Delete the current login session.
+    responses:
+      "204":
+        description: The session is absent or has been deleted.
+
+/api/auth/password/register:
+  post:
+    tags: [Authentication]
+    operationId: registerWithPassword
+    summary: Create a User, Personal Space, Password Credential, and session.
+    security: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: ../schemas/identity.yaml#/PasswordRegistration
+    responses:
+      "201":
+        description: Registered and authenticated.
+        headers:
+          Set-Cookie:
+            schema:
+              type: string
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/identity.yaml#/AuthenticatedSession
+      "400":
+        $ref: ../schemas/common.yaml#/BadRequest
+      "409":
+        $ref: ../schemas/common.yaml#/Conflict
+
+/api/auth/password/login:
+  post:
+    tags: [Authentication]
+    operationId: loginWithPassword
+    summary: Authenticate with a System Username and password.
+    security: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: ../schemas/identity.yaml#/PasswordLogin
+    responses:
+      "200":
+        description: Authenticated.
+        headers:
+          Set-Cookie:
+            schema:
+              type: string
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/identity.yaml#/AuthenticatedSession
+      "401":
+        description: Username or password is invalid.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ErrorResponse
+
+/api/auth/password:
+  put:
+    tags: [Authentication]
+    operationId: changePassword
+    summary: Change the current User's password.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: ../schemas/identity.yaml#/PasswordChange
+    responses:
+      "204":
+        description: Password changed.
+      "400":
+        $ref: ../schemas/common.yaml#/BadRequest
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+      "409":
+        $ref: ../schemas/common.yaml#/Conflict
+
+/api/auth/cli/authorizations:
+  post:
+    tags: [Authentication]
+    operationId: startCliAuthorization
+    summary: Start a short-lived browser authorization for Workspace CLI.
+    security: []
+    responses:
+      "201":
+        description: CLI authorization request created.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/identity.yaml#/CliAuthorizationStart
+      "503":
+        description: The server is temporarily at capacity for CLI authorization requests.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ErrorResponse
+
+/api/auth/cli/authorizations/approve:
+  post:
+    tags: [Authentication]
+    operationId: approveCliAuthorization
+    summary: Approve a CLI authorization as the current signed-in User.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: ../schemas/identity.yaml#/CliAuthorizationApproval
+    responses:
+      "200":
+        description: CLI authorization approved.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/identity.yaml#/AuthenticatedSession
+      "400":
+        $ref: ../schemas/common.yaml#/BadRequest
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+      "409":
+        $ref: ../schemas/common.yaml#/Conflict
+      "410":
+        description: The CLI authorization request expired.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ErrorResponse
+
+/api/auth/cli/authorizations/exchange:
+  post:
+    tags: [Authentication]
+    operationId: exchangeCliAuthorization
+    summary: Poll and exchange an approved CLI authorization for a login session.
+    security: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: ../schemas/identity.yaml#/CliAuthorizationExchange
+    responses:
+      "200":
+        description: Authorization approved and exchanged for a new CLI login session.
+        headers:
+          Set-Cookie:
+            schema:
+              type: string
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/identity.yaml#/AuthenticatedSession
+      "202":
+        description: The User has not approved the request yet.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/identity.yaml#/CliAuthorizationPending
+      "400":
+        $ref: ../schemas/common.yaml#/BadRequest
+      "410":
+        description: The CLI authorization request expired.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ErrorResponse
+
+/api/auth/github/login:
+  get:
+    tags: [Authentication]
+    operationId: startGitHubLogin
+    summary: Start the GitHub OAuth login flow.
+    security: []
+    parameters:
+      - name: returnTo
+        in: query
+        required: false
+        schema:
+          type: string
+          pattern: ^/
+    responses:
+      "302":
+        description: Redirect to GitHub.
+        headers:
+          Location:
+            required: true
+            schema:
+              type: string
+              format: uri
+
+/api/auth/github/link:
+  get:
+    tags: [Authentication]
+    operationId: startGitHubLink
+    summary: Start GitHub OAuth to link the current User.
+    parameters:
+      - name: returnTo
+        in: query
+        required: false
+        schema:
+          type: string
+          pattern: ^/
+    responses:
+      "302":
+        description: Redirect to GitHub.
+        headers:
+          Location:
+            required: true
+            schema:
+              type: string
+              format: uri
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+
+/api/auth/github/callback:
+  get:
+    tags: [Authentication]
+    operationId: finishGitHubOAuth
+    summary: Validate the OAuth callback and finish login or linking.
+    security: []
+    parameters:
+      - name: code
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: state
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: error
+        in: query
+        required: false
+        schema:
+          type: string
+    responses:
+      "302":
+        description: Redirect to a validated local application path.
+        headers:
+          Location:
+            required: true
+            schema:
+              type: string
+
+/api/auth/github:
+  delete:
+    tags: [Authentication]
+    operationId: unlinkGitHub
+    summary: Unlink the current User's GitHub identity.
+    responses:
+      "200":
+        description: Updated authenticated session.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/identity.yaml#/AuthenticatedSession
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+      "409":
+        description: GitHub is the last authentication method.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ErrorResponse
+
+/api/auth/discord/login:
+  get:
+    tags: [Authentication]
+    operationId: startDiscordLogin
+    summary: Start the Discord OAuth login flow.
+    security: []
+    parameters:
+      - name: returnTo
+        in: query
+        required: false
+        schema:
+          type: string
+          pattern: ^/
+    responses:
+      "302":
+        description: Redirect to Discord.
+        headers:
+          Location:
+            required: true
+            schema:
+              type: string
+              format: uri
+
+/api/auth/discord/bot-login:
+  post:
+    tags: [Authentication]
+    operationId: loginWithDiscordBot
+    summary: Resolve or create a User from a trusted Discord Bot event and create a session.
+    description: |
+      This server-to-server endpoint trusts the Discord User ID asserted by the
+      configured Bot server. The caller must authenticate with the shared API key.
+    security:
+      - discordBotApiKey: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: ../schemas/identity.yaml#/DiscordBotLogin
+    responses:
+      "200":
+        description: Authenticated; a new User and Personal Space are created when necessary.
+        headers:
+          Set-Cookie:
+            schema:
+              type: string
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/identity.yaml#/AuthenticatedSession
+      "400":
+        $ref: ../schemas/common.yaml#/BadRequest
+      "401":
+        description: The Discord Bot API key is missing or invalid.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ErrorResponse
+      "503":
+        description: Discord Bot authentication is not configured.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ErrorResponse
+
+/api/auth/discord/link:
+  get:
+    tags: [Authentication]
+    operationId: startDiscordLink
+    summary: Start Discord OAuth to link the current User.
+    parameters:
+      - name: returnTo
+        in: query
+        required: false
+        schema:
+          type: string
+          pattern: ^/
+    responses:
+      "302":
+        description: Redirect to Discord.
+        headers:
+          Location:
+            required: true
+            schema:
+              type: string
+              format: uri
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+
+/api/auth/discord/callback:
+  get:
+    tags: [Authentication]
+    operationId: finishDiscordOAuth
+    summary: Validate the Discord OAuth callback and finish login or linking.
+    security: []
+    parameters:
+      - name: code
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: state
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: error
+        in: query
+        required: false
+        schema:
+          type: string
+    responses:
+      "302":
+        description: Redirect to a validated local application path.
+        headers:
+          Location:
+            required: true
+            schema:
+              type: string
+
+/api/auth/discord:
+  delete:
+    tags: [Authentication]
+    operationId: unlinkDiscord
+    summary: Unlink the current User's Discord identity.
+    responses:
+      "200":
+        description: Updated authenticated session.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/identity.yaml#/AuthenticatedSession
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+      "409":
+        description: Discord is the last authentication method.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/common.yaml#/ErrorResponse
+
+/api/users/me:
+  patch:
+    tags: [Users]
+    operationId: updateCurrentUser
+    summary: Update the current User's product profile.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: ../schemas/identity.yaml#/UserProfilePatch
+    responses:
+      "200":
+        description: Updated User.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/identity.yaml#/User
+      "400":
+        $ref: ../schemas/common.yaml#/BadRequest
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+      "409":
+        $ref: ../schemas/common.yaml#/Conflict

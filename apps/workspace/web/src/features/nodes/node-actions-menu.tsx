@@ -1,0 +1,290 @@
+import { useRouter } from "@tanstack/react-router";
+import { useQuery } from "@tanstack/react-query";
+import { CircleDot, Ellipsis, ExternalLink, Link2, Pencil, Share2, Trash2 } from "lucide-react";
+import { useState, type ReactElement, type ReactNode } from "react";
+import { useUpdateNode, useTrashNode } from "./nodes.commands";
+import type { components } from "../../../../generated/http/schema.js";
+import { ShareDialog } from "../permissions";
+import { spacesQueryOptions } from "../spaces/spaces.queries";
+import { spaceSupportsIssues } from "../spaces/space.rules";
+import { useI18n } from "../../shared/i18n";
+import {
+  Button,
+  ConfirmDialog,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuRoot,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+  Dialog,
+  DialogClose,
+  Field,
+  Input,
+  MenuContent,
+  MenuItem,
+  MenuRoot,
+  MenuSeparator,
+  MenuTrigger,
+  toast,
+  Tooltip,
+} from "../../shared/ui";
+
+import { defaultSharedView, resourceShareUrl } from "../resource-view/resource-view";
+
+type Node = components["schemas"]["NodeSummary"];
+
+export function NodeActionsMenu(props: {
+  readonly node: Node;
+  readonly onEdit?: () => void;
+  readonly onMutated?: () => void;
+  readonly children: (actions: ReactNode) => ReactElement;
+}) {
+  const { t } = useI18n();
+  const router = useRouter();
+  const [shareOpen, setShareOpen] = useState(false);
+  const [renameOpen, setRenameOpen] = useState(false);
+  const [editName, setEditName] = useState(props.node.name);
+  const [trashOpen, setTrashOpen] = useState(false);
+  const spaces = useQuery(spacesQueryOptions);
+  const space = spaces.data?.spaces.find((item) => item.id === props.node.spaceId);
+  // Referencing a file on an Issue is a triage action, so only Team Space editors and above see it.
+  const canReferenceInIssue =
+    space !== undefined && spaceSupportsIssues(space) && space.capabilities.triageIssues;
+  const nodeUrl = new URL(
+    `/nodes/${encodeURIComponent(props.node.id)}`,
+    window.location.origin,
+  ).toString();
+
+  const updateNode = useUpdateNode();
+  const trashNode = useTrashNode();
+  const trash = () => trashNode.mutate({
+    nodeId: props.node.id,
+    spaceId: props.node.spaceId,
+    beforeInvalidate: async () => {
+      if (router.matchRoute(
+        { to: "/nodes/$nodeId", params: { nodeId: props.node.id } },
+        { includeSearch: false },
+      )) {
+        await router.navigate({ to: "/home", replace: true });
+      }
+    },
+  }, {
+    onSuccess: () => {
+      setTrashOpen(false);
+      toast.success(t("movedToTrash"));
+      props.onMutated?.();
+    },
+    onError: (error) => toast.error(error instanceof Error ? error.message : t("trashActionFailed")),
+  });
+
+  const copyLink = async () => {
+    try {
+      await navigator.clipboard.writeText(resourceShareUrl(window.location.origin, props.node.id, defaultSharedView(props.node)));
+      toast.success(t("linkCopied"));
+    } catch {
+      toast.error(t("copyLinkFailed"));
+    }
+  };
+
+  const onAction = (action: NodeAction) => {
+    if (action === "open") {
+      window.open(nodeUrl, "_blank", "noopener,noreferrer");
+      return;
+    }
+    if (action === "share") {
+      setShareOpen(true);
+      return;
+    }
+    if (action === "copy") {
+      void copyLink();
+      return;
+    }
+    if (action === "issue") {
+      void router.navigate({
+        to: "/spaces/$spaceId/issues/new",
+        params: { spaceId: props.node.spaceId },
+        search: { node: props.node.id },
+      });
+      return;
+    }
+    if (action === "rename") {
+      if (props.onEdit) {
+        props.onEdit();
+        return;
+      }
+      setEditName(props.node.name);
+      setRenameOpen(true);
+      return;
+    }
+    setTrashOpen(true);
+  };
+
+  const dropdown = (
+    <MenuRoot>
+      <Tooltip content={t("actions")}>
+        <MenuTrigger
+          render={
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              aria-label={t("actions")}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter" && event.key !== " ") return;
+                event.preventDefault();
+                event.currentTarget.dispatchEvent(
+                  new KeyboardEvent("keydown", {
+                    key: "ArrowDown",
+                    bubbles: true,
+                    cancelable: true,
+                  }),
+                );
+              }}
+            >
+              <Ellipsis />
+            </Button>
+          }
+        />
+      </Tooltip>
+      <MenuContent align="end" sideOffset={4} className="w-56">
+        <NodeActionItems
+          node={props.node}
+          customEdit={Boolean(props.onEdit)}
+          canReferenceInIssue={canReferenceInIssue}
+          onAction={onAction}
+        />
+      </MenuContent>
+    </MenuRoot>
+  );
+
+  const submitEdit = () => {
+    const name = editName.trim();
+    if (!name) return;
+    updateNode.mutate({ nodeId: props.node.id, body: { name } }, {
+      onSuccess: () => {
+        setRenameOpen(false);
+        toast.success(t("itemUpdated"));
+        props.onMutated?.();
+      },
+      onError: (error) => toast.error(error instanceof Error ? error.message : t("updateFailed")),
+    });
+  };
+
+  return (
+    <>
+      <ContextMenuRoot>
+        <ContextMenuTrigger render={props.children(dropdown)} />
+        <ContextMenuContent className="w-56">
+          <NodeActionItems
+            context
+            node={props.node}
+            customEdit={Boolean(props.onEdit)}
+            canReferenceInIssue={canReferenceInIssue}
+            onAction={onAction}
+          />
+        </ContextMenuContent>
+      </ContextMenuRoot>
+
+      <ShareDialog
+        node={shareOpen ? props.node : null}
+        onClose={() => setShareOpen(false)}
+      />
+
+      <Dialog
+        open={renameOpen}
+        onOpenChange={(open) => {
+          if (!open) setRenameOpen(false);
+        }}
+        title={t("editNodeTitle", { name: props.node.name })}
+        footer={
+          <>
+            <DialogClose render={<Button variant="secondary">{t("cancel")}</Button>} />
+            <Button onClick={submitEdit} disabled={updateNode.isPending || !editName.trim()}>
+              {t("save")}
+            </Button>
+          </>
+        }
+      >
+        <Field label={t("name")} htmlFor={`rename-node-${props.node.id}`} required>
+          <Input
+            id={`rename-node-${props.node.id}`}
+            maxLength={255}
+            value={editName}
+            onChange={(event) => setEditName(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") submitEdit();
+            }}
+          />
+        </Field>
+      </Dialog>
+
+      <ConfirmDialog
+        open={trashOpen}
+        onOpenChange={setTrashOpen}
+        title={t("moveItemToTrash", { name: props.node.name })}
+        confirmText={t("move")}
+        cancelText={t("cancel")}
+        danger
+        disabled={trashNode.isPending}
+        onConfirm={trash}
+      />
+    </>
+  );
+}
+
+type NodeAction = "open" | "share" | "copy" | "issue" | "rename" | "trash";
+
+function NodeActionItems(props: {
+  readonly node: Node;
+  readonly context?: boolean;
+  readonly customEdit?: boolean;
+  readonly canReferenceInIssue?: boolean;
+  readonly onAction: (action: NodeAction) => void;
+}) {
+  const { t } = useI18n();
+  const Item = props.context ? ContextMenuItem : MenuItem;
+  const Separator = props.context ? ContextMenuSeparator : MenuSeparator;
+  const canEdit =
+    props.node.capabilities.rename || (props.customEdit && props.node.capabilities.move);
+
+  return (
+    <>
+      <Item onClick={() => props.onAction("open")}>
+        <ExternalLink />
+        {t("openInNewTab")}
+      </Item>
+      {props.node.capabilities.share ? (
+        <Item onClick={() => props.onAction("share")}>
+          <Share2 />
+          {t("shareAction")}
+        </Item>
+      ) : null}
+      <Item onClick={() => props.onAction("copy")}>
+        <Link2 />
+        {t("copyLink")}
+      </Item>
+      {props.canReferenceInIssue ? (
+        <Item onClick={() => props.onAction("issue")}>
+          <CircleDot />
+          {t("issueReferenceFromNode")}
+        </Item>
+      ) : null}
+      {canEdit ? <Separator /> : null}
+      {canEdit ? (
+        <Item onClick={() => props.onAction("rename")}>
+          <Pencil />
+          {props.customEdit ? t("editItem") : t("rename")}
+        </Item>
+      ) : null}
+      {props.node.capabilities.trash ? <Separator /> : null}
+      {props.node.capabilities.trash ? (
+        <Item
+          className="text-destructive data-highlighted:bg-destructive-soft data-highlighted:text-destructive [&_svg]:text-destructive"
+          onClick={() => props.onAction("trash")}
+        >
+          <Trash2 />
+          {t("moveToTrash")}
+        </Item>
+      ) : null}
+    </>
+  );
+}

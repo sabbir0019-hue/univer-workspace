@@ -1,0 +1,617 @@
+import type { ContentPermissions } from "./content-permissions.js";
+import type { Server } from "node:http";
+import {
+  MemorySessionTicketStore,
+  UniverCollabEndpoint,
+} from "@univerjs-pro/collaboration-endpoint";
+import { UniverCommentEndpoint } from "@univerjs-pro/collaboration-comment-endpoint";
+import { UniverHistoryEndpoint } from "@univerjs-pro/collaboration-history-endpoint";
+import type {
+  DeleteCommentMiddlewareContext,
+  IUniverCommentService,
+} from "@univerjs-pro/collaboration-comment-service";
+import type { IUniverHistoryService } from "@univerjs-pro/collaboration-history-service";
+import {
+  type IUnitSnapshotMaterializer,
+  CollabError,
+  type UniverCollabService,
+} from "@univerjs-pro/collaboration-service";
+import {
+  createNodeTransport,
+  type NodeHttpTransportContext,
+  type NodeTransportConnection,
+  type NodeTransportEndpoint,
+  type NodeWebSocketHandler,
+} from "@univerjs-pro/collaboration-transport-node";
+import {
+  ErrorCode,
+  UniverType,
+} from "@univerjs/protocol";
+import { UniverCollabWorktreeEndpoint } from "@univerjs-pro/collaboration-worktree-endpoint";
+import type { UniverCollabWorktreeService } from "@univerjs-pro/collaboration-worktree-service";
+import type {
+  ApplyWorktreeChangesetMiddlewareContext,
+  BaseWorktreeMiddlewareContext,
+  CommitWorktreeChangesetMiddlewareContext,
+  SubmitWorktreeChangesetMiddlewareContext,
+  WorktreeMiddlewareNext,
+} from "@univerjs-pro/collaboration-worktree-service";
+import { Router, type RequestHandler } from "express";
+import type { AccessResolver, ResourceContentAccess, UnitType } from "../../modules/access/index.js";
+import { ANONYMOUS_USER_ID, type IdentityModule } from "../../modules/identity/index.js";
+import type { WorktreesModule } from "../../modules/worktrees/index.js";
+import {
+  WORKTREE_CHANGE_FEED_PATH,
+  type WorktreeChangeFeed,
+} from "../realtime/worktree-change-feed.js";
+import {
+  anonymousProtocolUser,
+  protocolUser,
+} from "./protocol-user.js";
+import { setFinalMutationSize } from "./changeset-observation.js";
+import { createCollaborationMetricsMiddleware } from "../../middleware/metrics.js";
+import { createWorkspaceUnitComparison } from "./unit-comparison.js";
+
+const OK_ERROR = { code: ErrorCode.OK, message: "" };
+// Transport middleware runs before route matching. Allow only these SDK read paths.
+const ANONYMOUS_READ_PATHS = [
+  /^\/universer-api\/user\/session-ticket$/,
+  /^\/universer-api\/snapshot\/(?:block\/)?[^/]+\/unit\/[^/]+\/(?:rev\/[^/]+|block\/[^/]+|fetchmissing)$/,
+  /^\/universer-api\/comment\/unit\/[^/]+\/list$/,
+  /^\/universer-api\/history\/[^/]+\/(?:list|creators|cs)$/,
+];
+
+export interface CollaborationGateway {
+  readonly router: Router;
+  attachWebSocket(server: Server): void;
+  invalidateNodeAccess(): void;
+  dispose(): Promise<void>;
+}
+
+export function createCollaborationGateway(options: {
+  readonly contentPermissions: ContentPermissions;
+  readonly service: UniverCollabService;
+  readonly commentService: IUniverCommentService;
+  readonly historyService: IUniverHistoryService;
+  readonly identity: IdentityModule;
+  readonly access: AccessResolver;
+  readonly worktreeService: UniverCollabWorktreeService;
+  readonly snapshotMaterializer: Pick<IUnitSnapshotMaterializer, "materializeSnapshot">;
+  readonly worktrees: WorktreesModule;
+  readonly worktreeChangeFeed: WorktreeChangeFeed;
+}): CollaborationGateway {
+  const {
+    contentPermissions,
+    service,
+    commentService,
+    historyService,
+    identity,
+    access,
+    worktreeService,
+    worktrees,
+    worktreeChangeFeed,
+  } = options;
+  const ticketStore = new MemorySessionTicketStore();
+  const endpoint = new UniverCollabEndpoint(service, { ticketStore });
+  const commentEndpoint = new UniverCommentEndpoint({
+    service: commentService,
+    roomHost: endpoint,
+  });
+  const historyEndpoint = new UniverHistoryEndpoint(historyService);
+  const worktreeEndpoint = new UniverCollabWorktreeEndpoint(
+    worktreeService,
+    { ticketStore }
+  );
+  const transport = createNodeTransport();
+  const nodeAccessConnections = new Set<NodeTransportConnection>();
+
+  service.use("createUnit", async (context, next) => {
+    if (context.customData.source !== "product-api") {
+      throw new CollabError(
+        "PERMISSION_DENIED",
+        "Units must be created through the product API."
+      );
+    }
+    await next();
+  });
+  service.use("readUnitData", async (context, next) => {
+    if (context.customData.source === "product-api") {
+      await next();
+      return;
+    }
+    requireUnitAccess(access, context.userID, context.request.unitID);
+    await next();
+  });
+  service.use("submitChangeset", async (context, next) => {
+    requireUnitEdit(
+      access,
+      context.userID,
+      context.request.changeset.unitID
+    );
+    await next();
+  });
+  service.use("applyChangeset", async (context, next) => {
+    requireUnitEdit(
+      access,
+      context.userID,
+      context.request.changeset.unitID
+    );
+    await next();
+  });
+  service.use("commitChangeset", async (context, next) => {
+    for (const requirement of context.requiredUnitPermissions) {
+      if (!contentPermissions.allowed(context.userID, requirement)) {
+        throw new CollabError("PERMISSION_DENIED", "Content permission denied.");
+      }
+    }
+    setFinalMutationSize(context.changeset);
+    await next();
+  });
+
+  commentService.use("listComments", async (context, next) => {
+    requireCommentAccess(access, context.userID, context.request.unitID);
+    await next();
+  });
+  const authorizeCommentWrite = async (
+    context: {
+      readonly userID: string;
+      readonly request: { readonly unitID: string };
+    },
+    next: () => Promise<void>
+  ) => {
+    requireCommentAccess(access, context.userID, context.request.unitID);
+    await next();
+  };
+  commentService.use("addComment", authorizeCommentWrite);
+  commentService.use("replyComment", authorizeCommentWrite);
+  commentService.use("setThreadSolved", authorizeCommentWrite);
+  commentService.use("editComment", authorizeCommentWrite);
+  commentService.use("deleteComment", async (context, next) => {
+    authorizeCommentDelete(access, context);
+    await next();
+  });
+
+  const authorizeHistoryRead = async (
+    context: {
+      readonly userID: string;
+      readonly request: { readonly unitID: string };
+    },
+    next: () => Promise<void>
+  ) => {
+    requireUnitAccess(access, context.userID, context.request.unitID);
+    await next();
+  };
+  historyService.use("getHistoryList", authorizeHistoryRead);
+  historyService.use("listHistoryCreators", authorizeHistoryRead);
+  historyService.use("getHistoryChangesets", authorizeHistoryRead);
+
+  endpoint.use("connect", async (context, next) => {
+    const user = context.session.customData.user as
+      | ReturnType<typeof protocolUser>
+      | undefined;
+    context.member.name = user?.name ?? context.session.userID;
+    context.member.avatar = user?.avatar ?? "";
+    await next();
+  });
+  endpoint.use("joinUnit", async (context, next) => {
+    const resource = requireUnitAccess(
+      access,
+      context.session.userID,
+      context.unitID
+    );
+    if (resource.kind !== "univer") {
+      throw new CollabError("INVALID_REQUEST", "Unknown Unit Resource.");
+    }
+    await service.getUnitLoadData(
+      {
+        unitID: context.unitID,
+        type: protocolUnitType(resource.unitType),
+        revision: 0,
+      },
+      {
+        userID: context.session.userID,
+        customData: context.session.customData,
+      }
+    );
+    await next();
+  });
+
+  for (const action of [
+    "createWorktree",
+    "addWorktreeUnit",
+    "createWorktreeUnit",
+    "setWorktreeUnitRemoved",
+    "markWorktreeReady",
+    "reopenWorktree",
+    "discardWorktree",
+    "mergeWorktree",
+  ] as const) {
+    worktreeService.use(action, requireProductWorktreeManagement);
+  }
+  worktreeService.use("readWorktreeData", async (context, next) => {
+    if (context.customData.source === "product-api") {
+      await next();
+      return;
+    }
+    await requireWorktreeProtocolAccess(worktrees, {
+      userId: context.userID,
+      worktreeId: context.request.worktreeID,
+      write: false,
+    });
+    await next();
+  });
+  worktreeService.use("readUnitData", async (context, next) => {
+    if (context.customData.source === "product-api") {
+      await next();
+      return;
+    }
+    await requireWorktreeProtocolAccess(worktrees, {
+      userId: context.userID,
+      worktreeId: context.request.worktreeID,
+      unitId: context.request.unitID,
+      write: false,
+    });
+    await next();
+  });
+  for (const action of [
+    "submitChangeset",
+    "applyChangeset",
+    "commitChangeset",
+  ] as const) {
+    worktreeService.use(action, asyncWorktreeWriteAuthorization);
+  }
+  worktreeService.use("commitChangeset", async (context, next) => {
+    for (const requirement of context.requiredUnitPermissions) {
+      if (!contentPermissions.allowed(context.userID, requirement, true)) {
+        throw new CollabError("PERMISSION_DENIED", "Draft content permission denied; manage protection on Trunk.");
+      }
+    }
+    setFinalMutationSize(context.changeset);
+    await next();
+  });
+
+  async function asyncWorktreeWriteAuthorization(
+    context:
+      | SubmitWorktreeChangesetMiddlewareContext
+      | ApplyWorktreeChangesetMiddlewareContext
+      | CommitWorktreeChangesetMiddlewareContext,
+    next: WorktreeMiddlewareNext
+  ) {
+    await requireWorktreeProtocolAccess(worktrees, {
+      userId: context.userID,
+      worktreeId: context.request.worktreeID,
+      unitId: context.request.changeset.unitID,
+      write: true,
+    });
+    await next();
+  }
+  worktreeEndpoint.use("connect", async (context, next) => {
+    await requireWorktreeProtocolAccess(worktrees, {
+      userId: context.session.userID,
+      worktreeId: context.worktreeID,
+      write: false,
+    });
+    const user = context.session.customData.user as
+      | ReturnType<typeof protocolUser>
+      | undefined;
+    context.member.name = user?.name ?? context.session.userID;
+    context.member.avatar = user?.avatar ?? "";
+    await next();
+  });
+  worktreeEndpoint.use("joinUnit", async (context, next) => {
+    await requireWorktreeProtocolAccess(worktrees, {
+      userId: context.session.userID,
+      worktreeId: context.worktreeID,
+      unitId: context.unitID,
+      write: false,
+    });
+    await next();
+  });
+
+  transport.use(createCollaborationMetricsMiddleware());
+  transport.use(async (context, next) => {
+    const session = identity.getSession(cookieHeader(context));
+    if (!session.authenticated) {
+      const { pathname } = new URL(context.incomingMessage.url ?? "/", "http://localhost");
+      if (
+        context.incomingMessage.method !== "GET" ||
+        !ANONYMOUS_READ_PATHS.some((path) => path.test(pathname))
+      ) {
+        unauthenticated(context);
+        return;
+      }
+    }
+    context.userID = session.authenticated
+      ? session.user.id
+      : ANONYMOUS_USER_ID;
+    context.customData.user = session.authenticated
+      ? protocolUser(session.user)
+      : anonymousProtocolUser;
+    context.response.setHeader("Cache-Control", "private, no-store");
+    await next();
+  });
+  transport.register(historyEndpoint);
+  transport.register(commentEndpoint);
+  transport.register(worktreeEndpoint);
+  transport.register(worktreeChangeFeed.endpoint(ticketStore));
+  transport.register(trackConnections(endpoint, nodeAccessConnections));
+
+  const router = Router();
+  router.use((request, response, next) => {
+    try {
+      response.locals.session = identity.getSession(request.headers.cookie);
+      response.setHeader("Cache-Control", "private, no-store");
+      next();
+    } catch (error) {
+      next(error);
+    }
+  });
+  router.get("/user", (_request, response) => {
+    response.json({
+      error: OK_ERROR,
+      user: response.locals.session.authenticated
+        ? protocolUser(response.locals.session.user)
+        : anonymousProtocolUser,
+    });
+  });
+  router.use("/authz", contentPermissions.router);
+  router.use("/worktrees/:worktreeId/authz", contentPermissions.router);
+  router.get(
+    "/worktrees/:worktreeId/units/:unitId/comparison",
+    async (request, response) => {
+      const baseMode = request.query.baseMode ?? "trunk";
+      const view = request.query.view ?? "draft";
+      if ((baseMode !== "trunk" && baseMode !== "base") ||
+          (view !== "draft" && view !== "merged" && view !== "preview")) {
+        response.status(400).json({ message: "Invalid comparison mode." });
+        return;
+      }
+      const userId = identity.requireSession(request.headers.cookie).user.id;
+      const detail = await worktrees.get(userId, request.params.worktreeId);
+      const unit = detail.worktree.units.find(
+        (candidate) => candidate.unitId === request.params.unitId
+      );
+      if (!unit) {
+        response.status(404).json({ message: "Worktree Unit not found." });
+        return;
+      }
+      response.json(
+        await createWorkspaceUnitComparison({
+          service,
+          worktreeService,
+          materializer: options.snapshotMaterializer,
+          userId,
+          worktreeId: request.params.worktreeId,
+          unitId: unit.unitId,
+          unitName: unit.name,
+          unitType: unit.unitType,
+          source: unit.source,
+          change: unit.change,
+          baseMode,
+          view,
+        })
+      );
+    }
+  );
+  router.use(((request, response) => {
+    request.url = request.originalUrl;
+    transport.handleRequest(request, response);
+  }) satisfies RequestHandler);
+
+  let attachedServer: Server | undefined;
+  let disposed = false;
+  const handleUpgrade: NonNullable<Parameters<Server["on"]>[1]> = (
+    request,
+    socket,
+    head
+  ) => {
+    const url = new URL(request.url ?? "/", "http://localhost");
+    if (
+      url.pathname !== "/universer-api/comb/connect" &&
+      !url.pathname.startsWith("/universer-api/worktrees/") &&
+      url.pathname !== WORKTREE_CHANGE_FEED_PATH
+    ) {
+      return;
+    }
+    transport.handleUpgrade(request, socket, head);
+  };
+
+  return {
+    router,
+    attachWebSocket(server) {
+      if (attachedServer) {
+        throw new Error("Collaboration WebSocket is already attached.");
+      }
+      attachedServer = server;
+      server.on("upgrade", handleUpgrade);
+    },
+    invalidateNodeAccess() {
+      for (const connection of nodeAccessConnections) {
+        connection.close(1008, "Node access policy changed");
+      }
+      nodeAccessConnections.clear();
+    },
+    async dispose() {
+      if (disposed) return;
+      disposed = true;
+      attachedServer?.off("upgrade", handleUpgrade);
+      attachedServer = undefined;
+      await transport.dispose();
+    },
+  };
+}
+
+function trackConnections(
+  endpoint: NodeTransportEndpoint,
+  connections: Set<NodeTransportConnection>,
+): NodeTransportEndpoint {
+  return {
+    register(router) {
+      endpoint.register({
+        get: (path, handler) => router.get(path, handler),
+        post: (path, handler) => router.post(path, handler),
+        delete: (path, handler) => router.delete(path, handler),
+        upgrade(path, handler) {
+          router.upgrade(path, (context) =>
+            handler({
+              ...context,
+              accept(socketHandler) {
+                context.accept(trackConnectionLifecycle(socketHandler, connections));
+              },
+            }),
+          );
+        },
+      });
+    },
+    async dispose() {
+      await endpoint.dispose?.();
+    },
+  };
+}
+
+function trackConnectionLifecycle(
+  handler: NodeWebSocketHandler,
+  connections: Set<NodeTransportConnection>
+): NodeWebSocketHandler {
+  return {
+    async open(context) {
+      connections.add(context.connection);
+      await handler.open?.(context);
+    },
+    async message(context) {
+      await handler.message?.(context);
+    },
+    async close(context) {
+      connections.delete(context.connection);
+      await handler.close?.(context);
+    },
+  };
+}
+
+async function requireProductWorktreeManagement(
+  context: BaseWorktreeMiddlewareContext,
+  next: WorktreeMiddlewareNext
+): Promise<void> {
+  if (context.customData.source !== "product-api") {
+    throw new CollabError(
+      "PERMISSION_DENIED",
+      "Worktrees must be managed through the product API."
+    );
+  }
+  await next();
+}
+
+async function requireWorktreeProtocolAccess(
+  worktrees: WorktreesModule,
+  input: {
+    readonly userId: string;
+    readonly worktreeId: string;
+    readonly unitId?: string;
+    readonly write: boolean;
+  }
+): Promise<void> {
+  if (!(await worktrees.authorizeProtocol(input))) {
+    throw new CollabError(
+      "PERMISSION_DENIED",
+      "Cannot access this Worktree Unit."
+    );
+  }
+}
+
+function requireUnitAccess(
+  access: AccessResolver,
+  userId: string,
+  unitId: string
+): ResourceContentAccess {
+  const resource = access.resolveUnitContent(userId, unitId);
+  if (!resource?.capabilities.openContent) {
+    throw new CollabError("PERMISSION_DENIED", "Cannot read this unit.");
+  }
+  return resource;
+}
+
+function requireUnitEdit(
+  access: AccessResolver,
+  userId: string,
+  unitId: string
+): ResourceContentAccess {
+  const resource = requireUnitAccess(access, userId, unitId);
+  if (!resource.capabilities.editContent) {
+    throw new CollabError("PERMISSION_DENIED", "Unit is read-only.");
+  }
+  return resource;
+}
+
+function protocolUnitType(unitType: UnitType | null): UniverType {
+  switch (unitType) {
+    case "sheet":
+      return UniverType.UNIVER_SHEET;
+    case "doc":
+      return UniverType.UNIVER_DOC;
+    case "slide":
+      return UniverType.UNIVER_SLIDE;
+    case "board":
+      return UniverType.UNIVER_BOARD;
+    case "base":
+      return UniverType.UNIVER_BASE;
+    default:
+      throw new CollabError("INVALID_REQUEST", "Unknown unit type.");
+  }
+}
+
+function requireCommentAccess(
+  access: AccessResolver,
+  userId: string,
+  unitId: string
+): ResourceContentAccess {
+  const resource = requireUnitAccess(access, userId, unitId);
+  if (resource.kind !== "univer" || resource.unitType === null) {
+    throw new CollabError(
+      "INVALID_REQUEST",
+      "Thread Comments are available only for Univer Units."
+    );
+  }
+  return resource;
+}
+
+function authorizeCommentDelete(
+  access: AccessResolver,
+  context: DeleteCommentMiddlewareContext
+): void {
+  const resource = requireCommentAccess(
+    access,
+    context.userID,
+    context.request.unitID
+  );
+  if (
+    context.target.authorUserID !== context.userID &&
+    resource.role !== "owner" &&
+    resource.role !== "admin"
+  ) {
+    throw new CollabError(
+      "PERMISSION_DENIED",
+      "Only the comment author or a Resource administrator can delete it."
+    );
+  }
+}
+
+function cookieHeader(context: NodeHttpTransportContext) {
+  const value = context.incomingMessage.headers.cookie;
+  return Array.isArray(value) ? value.join("; ") : value;
+}
+
+function unauthenticated(context: NodeHttpTransportContext): void {
+  context.response.statusCode = 401;
+  context.response.setHeader(
+    "content-type",
+    "application/json; charset=utf-8"
+  );
+  context.response.end(
+    JSON.stringify({
+      error: {
+        code: ErrorCode.UNAUTHENTICATED,
+        message: "Authentication required.",
+      },
+    })
+  );
+}

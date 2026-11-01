@@ -1,0 +1,945 @@
+import type { ILanguagePack, UniverInstanceType } from "@univerjs/core";
+import {
+  isReadOnlyBlockedMutation,
+  isReferencedSourceBlockedMutation,
+  type ReadOnlyCommandEvent,
+} from "./features/read-only-guard";
+import {
+  LifecycleStages,
+  LocaleType,
+  LogLevel,
+  UserManagerService,
+} from "@univerjs/core";
+import {
+  SnapshotService,
+  UniverCollaborationPlugin,
+} from "@univerjs-pro/collaboration";
+import {
+  CollaborationUIEventId,
+  CollaborationUIEventService,
+  CollaborationStatus,
+  CollaborationController,
+  MemberService,
+  UniverCollaborationClientPlugin,
+  type IUniverCollaborationClientConfig,
+} from "@univerjs-pro/collaboration-client";
+import {
+  BrowserCollaborationSocketService,
+  DesktopCollaborationStatusDisplayController,
+  UniverCollaborationClientUIPlugin,
+} from "@univerjs-pro/collaboration-client-ui";
+import CollaborationClientEnUS from "@univerjs-pro/collaboration-client/locale/en-US";
+import CollaborationClientZhCN from "@univerjs-pro/collaboration-client/locale/zh-CN";
+import CollaborationClientUIEnUS from "@univerjs-pro/collaboration-client-ui/locale/en-US";
+import CollaborationClientUIZhCN from "@univerjs-pro/collaboration-client-ui/locale/zh-CN";
+import EditHistoryUIEnUS from "@univerjs-pro/edit-history-ui/locale/en-US";
+import EditHistoryUIZhCN from "@univerjs-pro/edit-history-ui/locale/zh-CN";
+import { UniverChartEmbedPlugin } from "@univerjs-pro/chart-embed";
+import { UniverEmbedPlugin } from "@univerjs-pro/embed";
+import { UniverEmbedUIPlugin } from "@univerjs-pro/embed-ui";
+import EmbedUIEnUS from "@univerjs-pro/embed-ui/locale/en-US";
+import EmbedUIZhCN from "@univerjs-pro/embed-ui/locale/zh-CN";
+import ExchangeClientEnUS from "@univerjs-pro/exchange-client/locale/en-US";
+import ExchangeClientZhCN from "@univerjs-pro/exchange-client/locale/zh-CN";
+import { UniverLicensePlugin } from "@univerjs-pro/license";
+import {
+  createWorktreeCollaborationConfig,
+  createWorktreeMergePreviewConfig,
+} from "@univerjs-pro/collaboration-worktree-client";
+import type {
+  FUniver,
+  IPreset,
+  IPresetPlugin,
+} from "@univerjs/presets";
+import { UnitObject, type IMember, type IUser } from "@univerjs/protocol";
+import type { Theme } from "@univerjs/themes";
+import { createUniver, mergeLocales } from "@univerjs/presets";
+import { useEffect, useRef, useState } from "react";
+import {
+  createWorkspaceReferencedUnitProviderRegistration,
+  type WorkspaceReferenceHostContext,
+} from "@univerjs/univer-workspace-reference-provider";
+import type { AppLanguage } from "../../shared/i18n";
+import { useI18n } from "../../shared/i18n";
+import { syncUniverTheme, useTheme } from "../../shared/theme";
+import { Alert } from "../../shared/ui/alert";
+import { Spinner } from "../../shared/ui/spinner";
+import { cn } from "../../shared/utils/cn";
+import {
+  collaborationStatusMessageKey,
+  type CollaborationIssue,
+} from "./collaboration-status";
+import {
+  configureExchangePresetPlugins,
+  createWorkspaceOutputPlugins,
+} from "./features/exchange-plugins";
+import { installNativePreviewNavigation } from "./native-preview";
+import {
+  decodeMergePreviewEvaluation,
+  resolveMergeReview,
+} from "./merge-review";
+import { withLiveSheetReferences } from "./live-sheet-references";
+import { createEmbedProductRuntime } from "./embed-product-runtime";
+import { subscribeWorkspaceCollaborators } from "./workarounds/collaboration-members";
+import { installHistoryShapeFormulaSdkWorkaround } from "./workarounds/history-shape-formula-model";
+import { resolveUniverLicense } from "./features/univer-license";
+import {
+  withWorkspaceSnapshotServerOverride,
+  type WorkspaceHostSnapshotScope,
+} from "./workspace-snapshot-server-adapter";
+
+import "@univerjs-pro/collaboration-client-ui/lib/index.css";
+import "@univerjs-pro/edit-history-ui/lib/index.css";
+import "@univerjs-pro/collaboration-client/facade";
+import "@univerjs-pro/embed/facade";
+import "@univerjs-pro/embed-ui/lib/index.css";
+import "@univerjs-pro/exchange-client/facade";
+import "@univerjs-pro/exchange-client/lib/index.css";
+
+installHistoryShapeFormulaSdkWorkaround();
+
+const CONTENT_PERMISSION_TYPES = [
+  UnitObject.Worksheet, UnitObject.SelectRange,
+  UnitObject.DocumentSection, UnitObject.DocumentParagraph, UnitObject.DocumentEntity,
+  UnitObject.SlidePage, UnitObject.SlideElement, UnitObject.SlideMaster,
+  UnitObject.BoardElement, UnitObject.BaseTable, UnitObject.BaseField,
+  UnitObject.BaseRecord, UnitObject.BaseView, UnitObject.BaseDashboard,
+];
+
+export interface CollaborationEditorProps {
+  readonly previewToken?: string;
+  readonly unitId: string;
+  readonly user: {
+    readonly id: string;
+    readonly displayName: string;
+    readonly avatarUrl: string | null;
+    readonly anonymous?: boolean;
+  };
+  readonly collaborationScope?:
+    | { readonly kind: "trunk" }
+    | {
+        readonly kind: "worktree" | "mergePreview";
+        readonly worktreeId: string;
+      };
+  readonly mappedUnitIds?: readonly string[];
+  readonly readOnly?: boolean;
+  readonly onCollaboratorsChange?: (members: readonly IMember[]) => void;
+}
+
+export interface WorkspaceHistoryDefinition {
+  readonly createPlugin: (containerId: string) => IPresetPlugin;
+  readonly locales: Readonly<Record<AppLanguage, ILanguagePack>>;
+  readonly providedByPreset?: boolean;
+}
+
+export interface ICollaborationEditorDefinition {
+  readonly label: string;
+  readonly history: WorkspaceHistoryDefinition;
+  readonly enableDocumentCollaborationUI?: boolean;
+  readonly liveSheetReferences?: boolean;
+  readonly collaborationProvidedByPreset?: boolean;
+  readonly exchangeProvidedByPreset?: boolean;
+  readonly exchangeEnabled?: boolean;
+  readonly licenseProvidedByPreset?: boolean;
+  readonly hideCollaborationStatus?: boolean;
+  readonly useCustomCollaborationStatus?: boolean;
+  /**
+   * Touch editors built on UniverMobileUIPlugin. Embed UI needs the desktop
+   * ribbon services, so mobile editors keep only the Embed runtime, as the
+   * official mobile compositions do.
+   */
+  readonly mobile?: boolean;
+  readonly theme: Theme;
+  readonly createPresets: (
+    container: HTMLElement,
+    license: string,
+    collaborationScope: NonNullable<
+      CollaborationEditorProps["collaborationScope"]
+    >,
+    compact: boolean
+  ) => IPreset[];
+  readonly locales: Readonly<Record<AppLanguage, ILanguagePack>>;
+  readonly collaborationFeaturePlugins?: () => IPresetPlugin[];
+  readonly exchangeFeaturePlugins?: () => IPresetPlugin[];
+  readonly printFeaturePlugins?: () => IPresetPlugin[];
+  readonly previewDownload?: (api: FUniver, unitId: string) => Promise<void>;
+  readonly configurePreview?: (api: FUniver, unitId: string, container: HTMLElement) => { dispose(): void };
+  readonly load: (
+    univerAPI: FUniver,
+    unitId: string
+  ) => Promise<unknown | null>;
+}
+
+export function createCollaborationEditor(
+  definition: ICollaborationEditorDefinition
+) {
+  const collaborationStatusPresentation = resolveCollaborationStatusPresentation(
+    definition.hideCollaborationStatus,
+    definition.useCustomCollaborationStatus
+  );
+  return function CollaborationEditor({
+    unitId,
+    previewToken,
+    user,
+    collaborationScope = { kind: "trunk" },
+    mappedUnitIds,
+    readOnly = false,
+    onCollaboratorsChange,
+  }: CollaborationEditorProps) {
+    const container = useRef<HTMLDivElement>(null);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState<string | null>(null);
+    const [collaborationStatus, setCollaborationStatus] =
+      useState<CollaborationStatus>(CollaborationStatus.NOT_COLLAB);
+    const [collaborationIssue, setCollaborationIssue] =
+      useState<CollaborationIssue>(null);
+    const { language, t } = useI18n();
+    const { resolvedTheme } = useTheme();
+    const resolvedThemeRef = useRef(resolvedTheme);
+    const univerAPIRef = useRef<FUniver | null>(null);
+    const mappedUnitIdsKey = mappedUnitIds?.join("\u0000") ?? "";
+    resolvedThemeRef.current = resolvedTheme;
+
+    useEffect(() => {
+      if (univerAPIRef.current) {
+        syncUniverTheme(univerAPIRef.current, resolvedTheme);
+      }
+    }, [resolvedTheme]);
+
+    useEffect(() => {
+      const element = container.current;
+      if (!element) return;
+      setLoading(true);
+      setError(null);
+      setCollaborationIssue(null);
+      let disposed = false;
+      let previewLayout: { dispose(): void } | undefined;
+      let previewNavigation: { dispose(): void } | undefined;
+      let mountedUniver: ReturnType<typeof createUniver>["univer"] | null =
+        null;
+      let embedProducts: ReturnType<typeof createEmbedProductRuntime> | undefined;
+      const referencedUnitIds = new Set<string>();
+      let statusListener: { dispose(): void } | null = null;
+      let collaboratorsListener: { dispose(): void } | null = null;
+      let collaborators: readonly IMember[] = [];
+      let collaborationUIEventListener: { unsubscribe(): void } | null = null;
+      let referenceWriteGuard: { dispose(): void } | null = null;
+      let readOnlyListener: { dispose(): void } | null = null;
+      let readOnlyLifecycleListener: { dispose(): void } | null = null;
+      onCollaboratorsChange?.([]);
+
+      const mount = async () => {
+        if (!element.id) {
+          element.id = `univer-${definition.label}-${unitId}`;
+        }
+        const resolvedCollaboration = await resolveCollaborationConfig(
+          collaborationScope,
+          unitId
+        );
+        if (disposed) return;
+        const exchangeEnabled =
+          collaborationScope.kind === "trunk" &&
+          definition.exchangeEnabled !== false &&
+          !user.anonymous;
+        const collaborationConfig = {
+          ...resolvedCollaboration.pluginConfig,
+          ...(user.anonymous
+            ? { enableOfflineEditing: false, enableSingleActiveInstanceLock: false }
+            : {}),
+          override: withWorkspaceSnapshotServerOverride(
+            resolvedCollaboration.pluginConfig.override,
+            {
+              hostScope: resolvedCollaboration.hostSnapshotScope,
+              origin: window.location.origin,
+              resolveMergePreview: loadMergeReviewResolution,
+            }
+          ),
+        };
+        const referenceHostContext = createReferenceHostContext(
+          collaborationScope,
+          mappedUnitIds
+        );
+        const snapshotReferenceProvider =
+          createWorkspaceReferencedUnitProviderRegistration({
+            hostContext: referenceHostContext,
+            ...(definition.mobile ? {} : { prepareUnit: async (unitType: UniverInstanceType) => {
+              if (!embedProducts) throw new Error("The embed runtime is not ready.");
+              await embedProducts.ensure(unitType);
+            } }),
+            resolveSnapshotService: () => {
+              if (!mountedUniver) {
+                throw new Error(
+                  "Workspace SnapshotService is not ready."
+                );
+              }
+              return mountedUniver.__getInjector().get(SnapshotService);
+            },
+          });
+        const preparedReferenceProvider = {
+          ...snapshotReferenceProvider,
+          provider: {
+            async ensureUnit(input: Parameters<typeof snapshotReferenceProvider.provider.ensureUnit>[0]) {
+              const result = await snapshotReferenceProvider.provider.ensureUnit(input);
+              if (result.unitId !== unitId) referencedUnitIds.add(result.unitId);
+              return result;
+            },
+          },
+        };
+        const referenceProvider = definition.liveSheetReferences ? withLiveSheetReferences(
+          preparedReferenceProvider,
+          referenceHostContext,
+          async (sourceUnitId) => {
+            if (disposed || !mountedUniver) throw new Error("Editor was disposed.");
+            if (sourceUnitId === unitId) return;
+            await mountedUniver.__getInjector()
+              .get(CollaborationController).readyForCollab(sourceUnitId);
+          },
+        ) : preparedReferenceProvider;
+        const license = resolveUniverLicense();
+        const licensePlugins: IPresetPlugin[] =
+          definition.licenseProvidedByPreset
+            ? []
+            : [
+                [
+                  UniverLicensePlugin,
+                  {
+                    license,
+                  },
+                ],
+              ];
+        let presets = definition.createPresets(
+          element,
+          license,
+          collaborationScope,
+          Boolean(previewToken)
+        );
+        if (licensePlugins.length > 0) {
+          // createUniver registers every preset before its top-level plugins.
+          // Keep License ahead of Pro feature presets so their dependency
+          // registration does not install a second License plugin implicitly.
+          presets = [{ plugins: licensePlugins }, ...presets];
+        }
+        const collaborationPlugins: IPresetPlugin[] =
+          definition.collaborationProvidedByPreset
+            ? []
+            : [
+                UniverCollaborationPlugin,
+                [
+                  UniverCollaborationClientPlugin,
+                  {
+                    socketService: BrowserCollaborationSocketService,
+                    enableOfflineEditing: true,
+                    enableAuthServer: true,
+                    wsSessionTicketUrl:
+                      "/universer-api/user/session-ticket",
+                    authzUrl: "/universer-api/authz",
+                    objectPermissionTypes: CONTENT_PERMISSION_TYPES,
+                    loginUrlKey: "/login",
+                    sendChangesetTimeout: 200,
+                    ...collaborationConfig,
+                  },
+                ],
+                [
+                  UniverCollaborationClientUIPlugin,
+                  {
+                    enableDocumentCollaborationUI:
+                      definition.enableDocumentCollaborationUI,
+                    override: collaborationStatusPresentation.suppressNative
+                      ? [
+                          [
+                            DesktopCollaborationStatusDisplayController,
+                            null,
+                          ],
+                        ]
+                      : undefined,
+                  },
+                ],
+              ];
+        const collaborationFeaturePlugins =
+          definition.collaborationFeaturePlugins?.() ?? [];
+        const historyFeaturePlugins = createWorkspaceHistoryPlugins(
+          collaborationScope,
+          definition.history,
+          element.id
+        );
+        const outputPlugins = createWorkspaceOutputPlugins({
+          origin: window.location.origin,
+          exchangeEnabled,
+          exchangeProvidedByPreset:
+            definition.exchangeProvidedByPreset === true,
+          exchangeFeaturePlugins:
+            definition.exchangeFeaturePlugins?.() ?? [],
+          printFeaturePlugins: definition.printFeaturePlugins?.() ?? [],
+        });
+        if (definition.collaborationProvidedByPreset) {
+          presets = configurePresetCollaboration(
+            presets,
+            collaborationConfig,
+            definition,
+            exchangeEnabled,
+            collaborationScope.kind === "trunk",
+            element.id
+          );
+        }
+        const univerLocale =
+          language === "zh-CN" ? LocaleType.ZH_CN : LocaleType.EN_US;
+        const { univer, univerAPI } = createUniver({
+          locale: univerLocale,
+          locales: {
+            [univerLocale]: mergeLocales(
+              definition.locales[language],
+              language === "zh-CN" ? EmbedUIZhCN : EmbedUIEnUS,
+              language === "zh-CN"
+                ? CollaborationClientZhCN
+                : CollaborationClientEnUS,
+              language === "zh-CN"
+                ? CollaborationClientUIZhCN
+                : CollaborationClientUIEnUS,
+              ...(exchangeEnabled
+                ? [
+                    language === "zh-CN"
+                      ? ExchangeClientZhCN
+                      : ExchangeClientEnUS,
+                  ]
+                : []),
+              ...historyLocales(language, definition.history)
+            ),
+          },
+          theme: definition.theme,
+          darkMode: resolvedThemeRef.current === "dark",
+          logLevel: LogLevel.WARN,
+          collaboration: true,
+          presets,
+          plugins: [
+            ...collaborationPlugins,
+            ...collaborationFeaturePlugins,
+            ...historyFeaturePlugins,
+            ...outputPlugins,
+            [
+              UniverEmbedPlugin,
+              {
+                resourceRefUnitProviderRegistrations: [
+                  referenceProvider,
+                ],
+              },
+            ],
+            ...(definition.mobile ? [] : [UniverEmbedUIPlugin]),
+            // Referenced charts (Docs/Slides/Boards cross-Unit data sources) need
+            // this runtime after the embed plugin owns the referenced-Unit policy.
+            UniverChartEmbedPlugin,
+          ],
+        });
+        mountedUniver = univer;
+        // Mobile keeps its existing model-only reference path; desktop presets
+        // cannot share the mobile workbench's dependency registrations.
+        if (!definition.mobile) embedProducts = createEmbedProductRuntime({
+          univer, container: element, license,
+          plugins: [
+            ...presets.flatMap((preset) => preset.plugins),
+            ...collaborationPlugins, ...collaborationFeaturePlugins,
+            ...historyFeaturePlugins, ...outputPlugins,
+            UniverEmbedPlugin, UniverEmbedUIPlugin, UniverChartEmbedPlugin,
+          ],
+        });
+        univerAPIRef.current = univerAPI;
+        // Referenced sources are read-only; live Sheet observers may still receive OT.
+        referenceWriteGuard = univerAPI.addEvent(
+          univerAPI.Event.BeforeCommandExecute,
+          (event) => {
+            if (isReferencedSourceBlockedMutation(event, referencedUnitIds)) event.cancel = true;
+          },
+        );
+        collaborationUIEventListener = univer
+          .__getInjector()
+          .get(CollaborationUIEventService)
+          .event$.subscribe((event) => {
+            if (disposed) return;
+            if (event.id === CollaborationUIEventId.PERMISSION_DENIED) {
+              setCollaborationIssue("permission");
+            } else if (event.id === CollaborationUIEventId.CONFLICT) {
+              setCollaborationIssue("conflict");
+            }
+          });
+        if (readOnly) {
+          const installReadOnlyGuard = () => {
+            if (disposed || readOnlyListener) return;
+            const guardedUnitIds = new Set([unitId, ...(mappedUnitIds ?? [])]);
+            readOnlyListener = univerAPI.addEvent(
+              univerAPI.Event.BeforeCommandExecute,
+              (event) => {
+                const command = event as ReadOnlyCommandEvent & { cancel: boolean };
+                if (isReadOnlyBlockedMutation(command, guardedUnitIds)) {
+                  command.cancel = true;
+                }
+              }
+            );
+          };
+          if (
+            univerAPI.getCurrentLifecycleStage() >=
+            LifecycleStages.Rendered
+          ) {
+            installReadOnlyGuard();
+          } else {
+            readOnlyLifecycleListener = univerAPI.addEvent(
+              univerAPI.Event.LifeCycleChanged,
+              ({ stage }) => {
+                if (stage < LifecycleStages.Rendered) return;
+                readOnlyLifecycleListener?.dispose();
+                readOnlyLifecycleListener = null;
+                installReadOnlyGuard();
+              }
+            );
+          }
+        }
+
+        const protocolUser: IUser = {
+          userID: user.id,
+          name: user.displayName,
+          avatar: user.avatarUrl ?? "",
+          anonymous: user.anonymous === true,
+          canBindAnonymous: false,
+          phone: "",
+          email: "",
+          createTimestamp: 0,
+        };
+        univer
+          .__getInjector()
+          .get(UserManagerService)
+          .setCurrentUser(protocolUser);
+
+        const collaboration = univerAPI.getCollaboration();
+        statusListener = univerAPI.addEvent(
+          univerAPI.Event.CollaborationStatusChanged,
+          (event) => {
+            if (!disposed && event.unitId === unitId) {
+              setCollaborationStatus(event.status);
+              onCollaboratorsChange?.(
+                event.status === CollaborationStatus.OFFLINE ? [] : collaborators
+              );
+              if (event.status !== CollaborationStatus.CONFLICT) {
+                setCollaborationIssue(null);
+              }
+            }
+          }
+        );
+        const unit = await loadEditorUnit(
+          definition,
+          univerAPI,
+          univer,
+          unitId,
+          collaborationConfig
+        );
+        if (!disposed && !unit) {
+          throw new Error(
+            `The ${definition.label} could not be loaded.`
+          );
+        }
+        if (!disposed) {
+          setCollaborationStatus(
+            collaboration.getCollaborationStatus(unitId)
+          );
+          if (previewToken) {
+            previewLayout = definition.configurePreview?.(univerAPI, unitId, element);
+            previewNavigation = installNativePreviewNavigation(univerAPI, unitId, previewToken,
+              exchangeEnabled && definition.previewDownload
+                ? () => definition.previewDownload!(univerAPI, unitId) : undefined);
+          }
+          setLoading(false);
+        }
+        if (
+          !disposed &&
+          onCollaboratorsChange &&
+          collaborationScope.kind !== "mergePreview"
+        ) {
+          collaboratorsListener = subscribeWorkspaceCollaborators(
+            univer.__getInjector().get(MemberService),
+            unitId,
+            (members) => {
+              collaborators = members;
+              if (!disposed) {
+                onCollaboratorsChange(
+                  collaboration.getCollaborationStatus(unitId) === CollaborationStatus.OFFLINE
+                    ? []
+                    : members
+                );
+              }
+            }
+          );
+        }
+      };
+
+      mount().catch((reason: unknown) => {
+        if (disposed) return;
+        setLoading(false);
+        setError(
+          reason instanceof Error
+            ? reason.message
+            : `The ${definition.label} could not be loaded.`
+        );
+      });
+
+      return () => {
+        disposed = true;
+        previewNavigation?.dispose();
+        previewLayout?.dispose();
+        collaboratorsListener?.dispose();
+        onCollaboratorsChange?.([]);
+        statusListener?.dispose();
+        collaborationUIEventListener?.unsubscribe();
+        referenceWriteGuard?.dispose();
+        readOnlyListener?.dispose();
+        readOnlyLifecycleListener?.dispose();
+        embedProducts?.dispose();
+        mountedUniver?.dispose();
+        univerAPIRef.current = null;
+      };
+    }, [
+      collaborationScope.kind,
+      collaborationScope.kind === "trunk"
+        ? ""
+        : collaborationScope.worktreeId,
+      previewToken,
+      mappedUnitIdsKey,
+      language,
+      unitId,
+      user.anonymous,
+      user.avatarUrl,
+      user.displayName,
+      user.id,
+      readOnly,
+      onCollaboratorsChange,
+    ]);
+
+    return (
+      <div className="univer-editor-shell">
+        {!loading &&
+        !error &&
+        collaborationStatusPresentation.showCustom && !previewToken ? (
+          <div
+            className={cn(
+              "pointer-events-none absolute top-3 right-4 z-10 flex items-center gap-1.5 rounded-full border border-border bg-background/85 py-1 pr-2.5 pl-2 text-xs font-medium shadow-sm backdrop-blur-sm",
+              collaborationStatus === CollaborationStatus.SYNCED &&
+                "text-success-soft-foreground",
+              collaborationStatus === CollaborationStatus.CONFLICT &&
+                "text-destructive-soft-foreground",
+              collaborationStatus === CollaborationStatus.OFFLINE &&
+                "text-warning-soft-foreground",
+              collaborationStatus !== CollaborationStatus.SYNCED &&
+                collaborationStatus !== CollaborationStatus.CONFLICT &&
+                collaborationStatus !== CollaborationStatus.OFFLINE &&
+                "text-muted-foreground"
+            )}
+          >
+            <span
+              className={cn(
+                "size-1.5 rounded-full",
+                collaborationStatus === CollaborationStatus.SYNCED &&
+                  "bg-success",
+                collaborationStatus === CollaborationStatus.CONFLICT &&
+                  "bg-destructive",
+                collaborationStatus === CollaborationStatus.OFFLINE &&
+                  "bg-warning",
+                collaborationStatus !== CollaborationStatus.SYNCED &&
+                  collaborationStatus !== CollaborationStatus.CONFLICT &&
+                  collaborationStatus !== CollaborationStatus.OFFLINE &&
+                  "bg-subtle-foreground"
+              )}
+            />
+            {t(
+              collaborationStatusMessageKey(
+                collaborationStatus,
+                collaborationIssue
+              )
+            )}
+          </div>
+        ) : null}
+        {error ? (
+          <Alert
+            variant="destructive"
+            className="m-6"
+            title={t("resourceOpenFailed")}
+          >
+            {error}
+          </Alert>
+        ) : null}
+        {loading ? (
+          <div className="absolute inset-0 z-10 grid place-items-center bg-background/85 backdrop-blur-[1px]">
+            <div className="flex items-center gap-2.5 text-sm text-muted-foreground">
+              <Spinner className="size-5 text-brand-600" />
+              {t("loadingType", { type: definition.label })}
+            </div>
+          </div>
+        ) : null}
+        <div ref={container} className="univer-editor-container" />
+      </div>
+    );
+  };
+}
+
+export function createWorkspaceHistoryPlugins(
+  collaborationScope: NonNullable<
+    CollaborationEditorProps["collaborationScope"]
+  >,
+  history: WorkspaceHistoryDefinition,
+  containerId: string
+): IPresetPlugin[] {
+  if (
+    collaborationScope.kind !== "trunk" ||
+    history.providedByPreset === true
+  ) {
+    return [];
+  }
+  return [history.createPlugin(containerId)];
+}
+
+function historyLocales(
+  language: AppLanguage,
+  history: WorkspaceHistoryDefinition
+): ILanguagePack[] {
+  return language === "zh-CN"
+    ? [EditHistoryUIZhCN, history.locales[language]]
+    : [EditHistoryUIEnUS, history.locales[language]];
+}
+
+function configurePresetCollaboration(
+  presets: IPreset[],
+  collaborationConfig: Awaited<
+    ReturnType<typeof resolveCollaborationConfig>
+  >["pluginConfig"],
+  definition: ICollaborationEditorDefinition,
+  exchangeEnabled: boolean,
+  historyEnabled: boolean,
+  containerId: string
+): IPreset[] {
+  const presetHistoryPlugin = definition.history.providedByPreset
+    ? definition.history.createPlugin(containerId)
+    : null;
+  const presetHistoryPluginConstructor = Array.isArray(presetHistoryPlugin)
+    ? presetHistoryPlugin[0]
+    : presetHistoryPlugin;
+  return configureExchangePresetPlugins(presets, exchangeEnabled).map(
+    (preset) => ({
+      ...preset,
+      plugins: preset.plugins.flatMap((plugin): IPresetPlugin[] => {
+        if (!Array.isArray(plugin)) return [plugin];
+        const [PluginConstructor, pluginConfig] = plugin;
+        if (
+          presetHistoryPlugin &&
+          PluginConstructor === presetHistoryPluginConstructor
+        ) {
+          return historyEnabled ? [presetHistoryPlugin] : [];
+        }
+        if (PluginConstructor === UniverCollaborationClientPlugin) {
+          return [[
+            PluginConstructor,
+            {
+              ...(pluginConfig as object),
+              enableOfflineEditing: true,
+              enableAuthServer: true,
+              wsSessionTicketUrl: "/universer-api/user/session-ticket",
+              authzUrl: "/universer-api/authz",
+              objectPermissionTypes: CONTENT_PERMISSION_TYPES,
+              loginUrlKey: "/login",
+              sendChangesetTimeout: 200,
+              ...collaborationConfig,
+            },
+          ]];
+        }
+        if (PluginConstructor === UniverCollaborationClientUIPlugin) {
+          return [[
+            PluginConstructor,
+            {
+              ...(pluginConfig as object),
+              enableDocumentCollaborationUI:
+                definition.enableDocumentCollaborationUI,
+              override: resolveCollaborationStatusPresentation(
+                definition.hideCollaborationStatus,
+                definition.useCustomCollaborationStatus
+              ).suppressNative
+                ? [[DesktopCollaborationStatusDisplayController, null]]
+                : undefined,
+            },
+          ]];
+        }
+        return [plugin];
+      }),
+    })
+  );
+}
+
+export function resolveCollaborationStatusPresentation(
+  hidden: boolean | undefined,
+  custom: boolean | undefined
+): { readonly suppressNative: boolean; readonly showCustom: boolean } {
+  return {
+    suppressNative: Boolean(hidden || custom),
+    showCustom: Boolean(custom && !hidden),
+  };
+}
+
+async function resolveCollaborationConfig(
+  scope: NonNullable<CollaborationEditorProps["collaborationScope"]>,
+  unitId: string
+): Promise<{
+  readonly pluginConfig: Partial<IUniverCollaborationClientConfig>;
+  readonly hostSnapshotScope: WorkspaceHostSnapshotScope;
+}> {
+  const wsProtocol =
+    window.location.protocol === "https:" ? "wss:" : "ws:";
+  if (scope.kind === "trunk") {
+    return {
+      pluginConfig: {
+        snapshotServerUrl: "/universer-api/snapshot",
+        collabSubmitChangesetUrl: "/universer-api/comb",
+        collabWebSocketUrl: `${wsProtocol}//${window.location.host}/universer-api/comb/connect`,
+        uploadFileServerUrl: "/universer-api/stream/file/upload",
+        signUrlServerUrl: "/universer-api/file/{fileID}/sign-url",
+      },
+      hostSnapshotScope: { kind: "trunk" },
+    };
+  }
+  if (scope.kind === "worktree") {
+    return {
+      pluginConfig: {
+        ...createWorktreeCollaborationConfig({
+          origin: window.location.origin,
+          worktreeID: scope.worktreeId,
+        }),
+        authzUrl: `/universer-api/worktrees/${encodeURIComponent(scope.worktreeId)}/authz`,
+        uploadFileServerUrl: `/universer-api/worktrees/${encodeURIComponent(scope.worktreeId)}/stream/file/upload`,
+        signUrlServerUrl: `/universer-api/worktrees/${encodeURIComponent(scope.worktreeId)}/file/{fileID}/sign-url`,
+      },
+      hostSnapshotScope: {
+        kind: "worktree",
+        worktreeId: scope.worktreeId,
+      },
+    };
+  }
+  const resolution = await loadMergeReviewResolution(
+    scope.worktreeId,
+    unitId
+  );
+  const worktreePluginConfig = {
+    ...createWorktreeCollaborationConfig({
+      origin: window.location.origin,
+      worktreeID: scope.worktreeId,
+    }),
+    authzUrl: `/universer-api/worktrees/${encodeURIComponent(scope.worktreeId)}/authz`,
+    uploadFileServerUrl: `/universer-api/worktrees/${encodeURIComponent(scope.worktreeId)}/stream/file/upload`,
+    signUrlServerUrl: `/universer-api/worktrees/${encodeURIComponent(scope.worktreeId)}/file/{fileID}/sign-url`,
+  };
+  if (resolution.kind === "worktree") {
+    return {
+      pluginConfig: worktreePluginConfig,
+      hostSnapshotScope: {
+        kind: "worktree",
+        worktreeId: scope.worktreeId,
+      },
+    };
+  }
+  if (resolution.kind === "unavailable") {
+    throw new Error(
+      resolution.reason === "conflict"
+        ? "The document has a merge conflict and cannot be previewed."
+        : "The merge preview is unavailable."
+    );
+  }
+  return {
+    pluginConfig: {
+      ...createWorktreeMergePreviewConfig({
+        origin: window.location.origin,
+        worktreeID: scope.worktreeId,
+        preview: resolution.preview,
+      }),
+      authzUrl: `/universer-api/worktrees/${encodeURIComponent(scope.worktreeId)}/authz`,
+      uploadFileServerUrl: `/universer-api/worktrees/${encodeURIComponent(scope.worktreeId)}/stream/file/upload`,
+      signUrlServerUrl: `/universer-api/worktrees/${encodeURIComponent(scope.worktreeId)}/file/{fileID}/sign-url`,
+    },
+    hostSnapshotScope: {
+      kind: "mergePreview",
+      worktreeId: scope.worktreeId,
+      preview: resolution.preview,
+    },
+  };
+}
+
+async function loadMergeReviewResolution(
+  worktreeId: string,
+  unitId: string
+): Promise<ReturnType<typeof resolveMergeReview>> {
+  const response = await fetch(
+    `/universer-api/worktrees/${encodeURIComponent(worktreeId)}/units/${encodeURIComponent(unitId)}/merge-preview`,
+    { credentials: "include" }
+  );
+  if (!response.ok) {
+    throw new Error("The merge preview could not be prepared.");
+  }
+  const body = (await response.json()) as {
+    readonly evaluation?: Parameters<typeof resolveMergeReview>[0];
+  };
+  return resolveMergeReview(decodeMergePreviewEvaluation(body.evaluation));
+}
+
+function loadEditorUnit(
+  definition: ICollaborationEditorDefinition,
+  univerAPI: FUniver,
+  univer: NonNullable<ReturnType<typeof createUniver>["univer"]>,
+  unitId: string,
+  collaborationConfig: { readonly enableCollaboration?: boolean }
+): Promise<unknown> {
+  // A frozen merge preview sets enableCollaboration to false so the local
+  // snapshot is not joined to a live room. The facade loaders still wait for
+  // readyForCollab, and that room is never created when collaboration is off.
+  if (collaborationConfig.enableCollaboration === false) {
+    return loadFrozenSnapshot(
+      univer.__getInjector().get(SnapshotService),
+      definition.label,
+      unitId
+    );
+  }
+  return definition.load(univerAPI, unitId);
+}
+
+function loadFrozenSnapshot(
+  snapshotService: SnapshotService,
+  label: string,
+  unitId: string
+): Promise<unknown> {
+  switch (label) {
+    case "spreadsheet":
+      return snapshotService.loadSheet(unitId, 0);
+    case "document":
+      return snapshotService.loadDoc(unitId, 0);
+    case "presentation":
+      return snapshotService.loadSlide(unitId, 0);
+    case "base":
+      return snapshotService.loadBase(unitId, 0);
+    case "board":
+      return snapshotService.loadBoard(unitId, 0);
+    default:
+      return Promise.reject(
+        new Error(`The ${label} could not be loaded.`)
+      );
+  }
+}
+
+function createReferenceHostContext(
+  scope: NonNullable<CollaborationEditorProps["collaborationScope"]>,
+  mappedUnitIds: readonly string[] | undefined
+): WorkspaceReferenceHostContext {
+  if (scope.kind === "trunk") return { view: { kind: "trunk" } };
+  if (!mappedUnitIds) {
+    throw new Error(
+      "Workspace Worktree Unit mapping is required for cross-Unit references."
+    );
+  }
+  return scope.kind === "worktree"
+    ? {
+        view: { kind: "worktree", worktreeId: scope.worktreeId },
+        mappedUnitIds,
+      }
+    : {
+        view: { kind: "mergePreview", worktreeId: scope.worktreeId },
+        mappedUnitIds,
+      };
+}

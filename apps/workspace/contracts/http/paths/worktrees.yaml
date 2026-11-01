@@ -1,0 +1,491 @@
+/api/worktrees:
+  get:
+    tags: [Worktrees]
+    operationId: listWorktrees
+    summary: List reviewable Worktrees and private Team Worktrees manageable by an Owner or Admin.
+    parameters:
+      - name: scope
+        in: query
+        required: false
+        schema:
+          type: string
+          enum: [active, processed, all]
+          default: active
+      - name: search
+        in: query
+        description: Literal substring of name, summary, creator display name or username, or Team Space name. ASCII case-insensitive; other characters match exactly. Applied before pagination.
+        schema:
+          type: string
+          maxLength: 200
+      - name: order
+        in: query
+        description: Descending product timestamp, with ascending Worktree ID as a stable tie-breaker. Cursors must be reused with the same filters and order.
+        schema:
+          type: string
+          enum: [updatedAtDesc, createdAtDesc]
+          default: updatedAtDesc
+      - name: kind
+        in: query
+        required: false
+        schema:
+          $ref: ../schemas/worktrees.yaml#/WorktreeKind
+      - name: teamSpaceId
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: state
+        in: query
+        required: false
+        description: Keep only Worktrees in these states. Repeat the parameter for several states. Applied before pagination, so a page is full unless the result is exhausted.
+        schema:
+          type: array
+          items:
+            $ref: ../schemas/worktrees.yaml#/WorktreeState
+        style: form
+        explode: true
+      - $ref: ../schemas/common.yaml#/CursorParameter
+      - $ref: ../schemas/common.yaml#/LimitParameter
+    responses:
+      "200":
+        description: |
+          Reviewable Worktrees plus Summary-only private Team Worktrees the
+          current Space Owner or Admin may manage.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/worktrees.yaml#/WorktreeList
+      "400":
+        $ref: ../schemas/common.yaml#/BadRequest
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+  post:
+    tags: [Worktrees]
+    operationId: createWorktree
+    summary: Create a User or Team Worktree.
+    parameters:
+      - $ref: ../schemas/common.yaml#/IdempotencyKeyParameter
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: ../schemas/worktrees.yaml#/CreateWorktree
+    responses:
+      "201":
+        description: Worktree created.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/worktrees.yaml#/WorktreeSummary
+      "202":
+        description: Worktree creation remains pending.
+        headers:
+          Location:
+            required: true
+            schema:
+              type: string
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/operations.yaml#/OperationEnvelope
+      "400":
+        $ref: ../schemas/common.yaml#/BadRequest
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+      "403":
+        $ref: ../schemas/common.yaml#/Forbidden
+      "409":
+        $ref: ../schemas/common.yaml#/Conflict
+
+/api/spaces/{spaceId}/worktrees/{number}:
+  parameters:
+    - name: spaceId
+      in: path
+      required: true
+      schema:
+        type: string
+    - name: number
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+  get:
+    tags: [Worktrees]
+    operationId: getWorktreeByNumber
+    summary: Get a Worktree by its repository-level number.
+    description: |
+      In a Team Space the number addresses a Team Worktree. In the caller's own Personal Space it addresses one of
+      the caller's User Worktrees. Hidden and missing Worktrees both return 404.
+    responses:
+      "200":
+        description: Worktree detail.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/worktrees.yaml#/WorktreeEnvelope
+      "400":
+        $ref: ../schemas/common.yaml#/BadRequest
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+      "404":
+        $ref: ../schemas/common.yaml#/NotFound
+
+/api/worktrees/{worktreeId}:
+  parameters:
+    - name: worktreeId
+      in: path
+      required: true
+      schema:
+        type: string
+  get:
+    tags: [Worktrees]
+    operationId: getWorktree
+    summary: Get Worktree metadata, current state, Units, and capabilities.
+    responses:
+      "200":
+        description: Worktree detail.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/worktrees.yaml#/WorktreeEnvelope
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+      "404":
+        $ref: ../schemas/common.yaml#/NotFound
+  patch:
+    tags: [Worktrees]
+    operationId: updateWorktree
+    summary: Update Worktree metadata or Team Worktree Visibility.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: ../schemas/worktrees.yaml#/PatchWorktree
+    responses:
+      "200":
+        description: Updated Worktree.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/worktrees.yaml#/WorktreeEnvelope
+      "400":
+        $ref: ../schemas/common.yaml#/BadRequest
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+      "403":
+        $ref: ../schemas/common.yaml#/Forbidden
+      "404":
+        $ref: ../schemas/common.yaml#/NotFound
+      "409":
+        $ref: ../schemas/common.yaml#/Conflict
+
+/api/worktrees/{worktreeId}/units:
+  parameters:
+    - name: worktreeId
+      in: path
+      required: true
+      schema:
+        type: string
+  post:
+    tags: [Worktrees]
+    operationId: addWorktreeUnit
+    summary: Add an existing Resource or create a Worktree-local Unit.
+    parameters:
+      - $ref: ../schemas/common.yaml#/IdempotencyKeyParameter
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: ../schemas/worktrees.yaml#/AddWorktreeUnit
+    responses:
+      "201":
+        description: Worktree Unit added.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/worktrees.yaml#/WorktreeUnitEnvelope
+      "202":
+        description: Unit creation or addition remains pending.
+        headers:
+          Location:
+            required: true
+            schema:
+              type: string
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/operations.yaml#/OperationEnvelope
+      "400":
+        $ref: ../schemas/common.yaml#/BadRequest
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+      "403":
+        $ref: ../schemas/common.yaml#/Forbidden
+      "404":
+        $ref: ../schemas/common.yaml#/NotFound
+      "409":
+        $ref: ../schemas/common.yaml#/Conflict
+
+/api/worktrees/{worktreeId}/units/{unitId}/open:
+  parameters:
+    - name: worktreeId
+      in: path
+      required: true
+      schema:
+        type: string
+    - name: unitId
+      in: path
+      required: true
+      schema:
+        type: string
+  post:
+    tags: [Worktrees]
+    operationId: openWorktreeUnit
+    summary: Open a Draft, Trunk, or Merge Preview Worktree Unit.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: ../schemas/worktrees.yaml#/OpenWorktreeUnit
+    responses:
+      "200":
+        description: Worktree Unit editor descriptor.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/worktrees.yaml#/WorktreeUnitOpenView
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+      "404":
+        $ref: ../schemas/common.yaml#/NotFound
+      "409":
+        $ref: ../schemas/common.yaml#/Conflict
+
+/api/worktrees/{worktreeId}/units/{unitId}/changesets:
+  parameters:
+    - name: worktreeId
+      in: path
+      required: true
+      schema:
+        type: string
+    - name: unitId
+      in: path
+      required: true
+      schema:
+        type: string
+  post:
+    tags: [Worktrees]
+    operationId: submitWorktreeChangeset
+    summary: Submit an authenticated non-realtime change to a Worktree Draft Unit.
+    description: |
+      The server binds the changeset to the authenticated User and a
+      server-owned collaboration member identity. Clients must not use the
+      internal collaboration transport endpoint for this operation.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: ../schemas/worktrees.yaml#/SubmitWorktreeChangeset
+    responses:
+      "200":
+        description: Changeset committed, deduplicated, rejected, or eligible for retry.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/worktrees.yaml#/WorktreeChangesetSubmitResult
+      "400":
+        $ref: ../schemas/common.yaml#/BadRequest
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+      "403":
+        $ref: ../schemas/common.yaml#/Forbidden
+      "404":
+        $ref: ../schemas/common.yaml#/NotFound
+      "409":
+        $ref: ../schemas/common.yaml#/Conflict
+
+/api/worktrees/{worktreeId}/ready:
+  parameters:
+    - name: worktreeId
+      in: path
+      required: true
+      schema:
+        type: string
+  post:
+    tags: [Worktrees]
+    operationId: markWorktreeReady
+    summary: Freeze a Draft and mark the Worktree ready to merge.
+    responses:
+      "200":
+        description: Current Worktree.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/worktrees.yaml#/WorktreeSummaryEnvelope
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+      "403":
+        $ref: ../schemas/common.yaml#/Forbidden
+      "404":
+        $ref: ../schemas/common.yaml#/NotFound
+      "409":
+        $ref: ../schemas/common.yaml#/Conflict
+
+/api/worktrees/{worktreeId}/reopen:
+  parameters:
+    - name: worktreeId
+      in: path
+      required: true
+      schema:
+        type: string
+  post:
+    tags: [Worktrees]
+    operationId: reopenWorktree
+    summary: Return a ready Worktree to Draft.
+    responses:
+      "200":
+        description: Current Worktree.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/worktrees.yaml#/WorktreeSummaryEnvelope
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+      "403":
+        $ref: ../schemas/common.yaml#/Forbidden
+      "404":
+        $ref: ../schemas/common.yaml#/NotFound
+      "409":
+        $ref: ../schemas/common.yaml#/Conflict
+
+/api/worktrees/{worktreeId}/merge:
+  parameters:
+    - name: worktreeId
+      in: path
+      required: true
+      schema:
+        type: string
+  post:
+    tags: [Worktrees]
+    operationId: mergeWorktree
+    summary: Merge Worktree Units and activate successful local Units.
+    parameters:
+      - $ref: ../schemas/common.yaml#/IdempotencyKeyParameter
+    responses:
+      "200":
+        description: Merge attempt reached a stable result.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/worktrees.yaml#/WorktreeOperationResponse
+      "202":
+        description: Merge or Activation remains pending.
+        headers:
+          Location:
+            required: true
+            schema:
+              type: string
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/operations.yaml#/OperationEnvelope
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+      "403":
+        $ref: ../schemas/common.yaml#/Forbidden
+      "404":
+        $ref: ../schemas/common.yaml#/NotFound
+      "409":
+        $ref: ../schemas/common.yaml#/Conflict
+
+/api/worktrees/{worktreeId}/discard:
+  parameters:
+    - name: worktreeId
+      in: path
+      required: true
+      schema:
+        type: string
+  post:
+    tags: [Worktrees]
+    operationId: discardWorktree
+    summary: Discard a Draft or ready Worktree without rolling back merged Units.
+    parameters:
+      - $ref: ../schemas/common.yaml#/IdempotencyKeyParameter
+    responses:
+      "200":
+        description: Worktree discarded.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/worktrees.yaml#/WorktreeOperationResponse
+      "202":
+        description: Discard remains pending.
+        headers:
+          Location:
+            required: true
+            schema:
+              type: string
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/operations.yaml#/OperationEnvelope
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+      "403":
+        $ref: ../schemas/common.yaml#/Forbidden
+      "404":
+        $ref: ../schemas/common.yaml#/NotFound
+      "409":
+        $ref: ../schemas/common.yaml#/Conflict
+
+/api/worktrees/{worktreeId}/units/{unitId}/removal:
+  parameters:
+    - name: worktreeId
+      in: path
+      required: true
+      schema:
+        type: string
+    - name: unitId
+      in: path
+      required: true
+      schema:
+        type: string
+  post:
+    tags: [Worktrees]
+    operationId: setWorktreeUnitRemoved
+    summary: Mark a draft Unit for deletion or undo its deletion intent.
+    description: Existing documents remain available until merge; canceled local Units are never published. Only editable drafts accept changes to deletion intent.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: false
+            required: [removed]
+            properties:
+              removed:
+                type: boolean
+    responses:
+      "200":
+        description: Worktree with updated deletion intent.
+        content:
+          application/json:
+            schema:
+              $ref: ../schemas/worktrees.yaml#/WorktreeEnvelope
+      "400":
+        $ref: ../schemas/common.yaml#/BadRequest
+      "401":
+        $ref: ../schemas/common.yaml#/Unauthorized
+      "403":
+        $ref: ../schemas/common.yaml#/Forbidden
+      "404":
+        $ref: ../schemas/common.yaml#/NotFound
+      "409":
+        $ref: ../schemas/common.yaml#/Conflict

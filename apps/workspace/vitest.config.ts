@@ -1,0 +1,14 @@
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  test: {
+    environment: "node",
+    fileParallelism: false,
+    pool: "threads",
+    include: [
+      "web/src/**/*.test.ts",
+      "server/src/**/*.test.ts",
+      "test/**/*.test.ts",
+    ],
+  },
+});
